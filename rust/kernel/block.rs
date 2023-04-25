@@ -2,6 +2,7 @@
 
 //! Types for working with the block layer.
 
+pub mod bio;
 pub mod mq;
 
 /// Bit mask for masking out the sector index in a page.
