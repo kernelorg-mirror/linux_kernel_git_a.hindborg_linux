@@ -51,6 +51,7 @@ pub mod firmware;
 pub mod fs;
 pub mod init;
 pub mod ioctl;
+pub mod irq;
 pub mod jump_label;
 #[cfg(CONFIG_KUNIT)]
 pub mod kunit;
