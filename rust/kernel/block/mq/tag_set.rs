@@ -12,10 +12,13 @@ use crate::{
     error,
     prelude::PinInit,
     try_pin_init,
-    types::{ForeignOwnable, Opaque},
+    types::{ARef, ForeignOwnable, Opaque},
 };
-use core::{convert::TryInto, marker::PhantomData};
+use core::{convert::TryInto, marker::PhantomData, ptr::NonNull};
+use core::sync::atomic::Ordering;
 use macros::{pin_data, pinned_drop};
+
+use super::Request;
 
 /// A wrapper for the C `struct blk_mq_tag_set`.
 ///
