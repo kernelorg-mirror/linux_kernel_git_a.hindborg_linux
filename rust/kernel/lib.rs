@@ -64,6 +64,7 @@ pub mod auxiliary;
 pub mod block;
 #[doc(hidden)]
 pub mod build_assert;
+mod cache_aligned;
 pub mod clk;
 #[cfg(CONFIG_CONFIGFS_FS)]
 pub mod configfs;
@@ -127,6 +128,7 @@ pub mod xarray;
 
 #[doc(hidden)]
 pub use bindings;
+pub use cache_aligned::CacheAligned;
 pub use macros;
 pub use uapi;
 
