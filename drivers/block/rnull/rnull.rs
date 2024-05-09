@@ -84,13 +84,21 @@ module! {
     },
 }
 
-#[pin_data]
+#[pin_data(PinnedDrop)]
 struct NullBlkModule {
     #[pin]
     configfs_subsystem: kernel::configfs::Subsystem<configfs::Config>,
     #[pin]
     param_disks: Mutex<KVec<GenDisk<NullBlkDevice>>>,
 }
+
+#[pinned_drop]
+impl PinnedDrop for NullBlkModule {
+    fn drop(self: Pin<&mut Self>) {
+        pr_info!("Dropping rnullb\n");
+    }
+}
+
 
 impl kernel::InPlaceModule for NullBlkModule {
     fn init(_module: &'static ThisModule) -> impl PinInit<Self, Error> {
