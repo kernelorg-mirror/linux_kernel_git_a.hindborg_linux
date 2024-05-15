@@ -69,7 +69,13 @@
 //!
 //! #[vtable]
 //! impl Operations for MyBlkDevice {
+//!     type RequestData = ();
 //!     type QueueData = ();
+//!
+//!     fn new_request_data(
+//!     ) -> impl PinInit<()> {
+//!         kernel::init::zeroed()
+//!     }
 //!
 //!     fn queue_rq(_queue_data: (), rq: ARef<Request<Self>>, _is_last: bool) -> Result {
 //!         Request::end_ok(rq);
