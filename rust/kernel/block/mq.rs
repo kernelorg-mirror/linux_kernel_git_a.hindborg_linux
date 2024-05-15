@@ -72,8 +72,10 @@
 //! impl Operations for MyBlkDevice {
 //!     type RequestData = ();
 //!     type QueueData = ();
+//!     type TagSetData = ();
 //!
 //!     fn new_request_data(
+//!         _tagset_data: <Self::TagSetData as ForeignOwnable>::Borrowed<'_>,
 //!     ) -> impl PinInit<()> {
 //!         pin_init::zeroed()
 //!     }
@@ -94,7 +96,7 @@
 //! }
 //!
 //! let tagset: Arc<TagSet<MyBlkDevice>> =
-//!     Arc::pin_init(TagSet::new(1, 256, 1, bindings::NUMA_NO_NODE), flags::GFP_KERNEL)?;
+//!     Arc::pin_init(TagSet::new(1, (), 256, 1, bindings::NUMA_NO_NODE), flags::GFP_KERNEL)?;
 //! let mut disk = gen_disk::GenDiskBuilder::new()
 //!     .capacity_sectors(4096)
 //!     .build(format_args!("myblk"), tagset, ())?;
