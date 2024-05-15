@@ -152,7 +152,7 @@ impl NullBlkDevice {
         }
 
         let tagset = Arc::pin_init(
-            TagSet::new(submit_queues, 256, 1, home_node),
+            TagSet::new(submit_queues, (), 256, 1, home_node),
             flags::GFP_KERNEL,
         )?;
 
@@ -306,8 +306,9 @@ kernel::impl_has_hr_timer! {
 impl Operations for NullBlkDevice {
     type QueueData = Pin<KBox<QueueData>>;
     type RequestData = Pdu;
+    type TagSetData = ();
 
-    fn new_request_data() -> impl PinInit<Self::RequestData> {
+    fn new_request_data(_tagset_data: &()) -> impl PinInit<Self::RequestData> {
         pin_init!(Pdu {
             timer <- kernel::time::hrtimer::HrTimer::new(kernel::time::hrtimer::HrTimerMode::Relative, kernel::time::hrtimer::ClockSource::Monotonic),
         })
