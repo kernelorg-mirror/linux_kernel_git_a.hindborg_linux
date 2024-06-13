@@ -464,6 +464,37 @@ impl<T: Operations> Owned<Request<T>> {
         // layer.
         unsafe { bindings::blk_mq_end_request(request_ptr, bindings::BLK_STS_OK as _) };
     }
+
+    /// Notify the block layer that the request completed with an error.
+    ///
+    /// Block device drivers must call one of the `end_ok`, `end_err` or `end`
+    /// functions when they have finished processing a request. Failure to do so
+    /// can lead to deadlock.
+    pub fn end_err(self, err: crate::error::Error) {
+        let request_ptr = self.0.get().cast();
+        core::mem::forget(self);
+
+        // SAFETY: By type invariant, `this.0` was a valid `struct request`. The
+        // success of the call to `try_set_end` guarantees that there are no
+        // `ARef`s pointing to this request. Therefore it is safe to hand it
+        // back to the block layer.
+        unsafe { bindings::blk_mq_end_request(request_ptr, err.to_blk_status()) };
+    }
+
+    /// Notify the block layer that the request completed with the status
+    /// indicated by `status`.
+    ///
+    /// Block device drivers must call one of the `end_ok`, `end_err` or `end`
+    /// functions when they have finished processing a request. Failure to do so
+    /// can lead to deadlock.
+    pub fn end(self, status: crate::error::Result) {
+        if let Err(e) = status {
+            self.end_err(e)
+        } else {
+            self.end_ok()
+        }
+    }
+
 }
 
 unsafe impl<T: Operations> Ownable for Request<T> {
