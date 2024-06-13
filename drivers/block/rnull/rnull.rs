@@ -126,4 +126,10 @@ impl Operations for NullBlkDevice {
     }
 
     fn commit_rqs(_queue_data:()) {}
+
+    fn complete(rq: ARef<mq::Request<Self>>) {
+        mq::Request::end_ok(rq)
+            .map_err(|_e| kernel::error::code::EIO)
+            .expect("Failed to complete request")
+    }
 }
