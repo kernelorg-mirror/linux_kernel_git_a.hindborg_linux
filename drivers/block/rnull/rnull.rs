@@ -12,6 +12,7 @@
 
 mod configfs;
 
+use configfs::IRQMode;
 use kernel::{
     alloc::{flags, KVec},
     block::mq::{
@@ -50,6 +51,10 @@ module! {
             default: 1,
             description: "Number of devices to register",
         },
+        irqmode: u8 {
+            default: 0,
+            description:  "IRQ completion handler. 0-none, 1-softirq",
+        },
     },
 }
 
@@ -75,6 +80,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                     *module_parameters::bs.get(),
                     *module_parameters::rotational.get() != 0,
                     *module_parameters::gb.get(),
+                    (*module_parameters::irqmode.get()).try_into()?,
                 )?;
                 disks.push(disk, flags::GFP_KERNEL)?;
             }
@@ -97,35 +103,41 @@ impl NullBlkDevice {
         block_size: u32,
         rotational: bool,
         capacity_mib: u64,
+        irq_mode: IRQMode,
     ) -> Result<GenDisk<Self>> {
         let tagset = Arc::pin_init(TagSet::new(1, 256, 1), flags::GFP_KERNEL)?;
+
+        let queue_data = Box::new(QueueData { irq_mode }, flags::GFP_KERNEL)?;
 
         gen_disk::GenDiskBuilder::new()
             .capacity_sectors(capacity_mib << 11)
             .logical_block_size(block_size)?
             .physical_block_size(block_size)?
             .rotational(rotational)
-            .build(fmt!("{}", name.to_str()?), tagset, ())
+            .build(fmt!("{}", name.to_str()?), tagset, queue_data)
     }
+}
+
+struct QueueData {
+    irq_mode: IRQMode,
 }
 
 #[vtable]
 impl Operations for NullBlkDevice {
-    type QueueData = ();
+    type QueueData = KBox<QueueData>;
 
     #[inline(always)]
-    fn queue_rq(_queue_data: (), rq: ARef<mq::Request<Self>>, _is_last: bool) -> Result {
-        mq::Request::end_ok(rq)
-            .map_err(|_e| kernel::error::code::EIO)
-            // We take no refcounts on the request, so we expect to be able to
-            // end the request. The request reference must be unique at this
-            // point, and so `end_ok` cannot fail.
-            .expect("Fatal error - expected to be able to end request");
-
+    fn queue_rq(queue_data: &QueueData, rq: ARef<mq::Request<Self>>, _is_last: bool) -> Result {
+        match queue_data.irq_mode {
+            IRQMode::None => mq::Request::end_ok(rq)
+                .map_err(|_e| kernel::error::code::EIO)
+                .expect("Fatal error - expected to be able to end request"),
+            IRQMode::Soft => mq::Request::complete(rq),
+        }
         Ok(())
     }
 
-    fn commit_rqs(_queue_data:()) {}
+    fn commit_rqs(_queue_data: &QueueData) {}
 
     fn complete(rq: ARef<mq::Request<Self>>) {
         mq::Request::end_ok(rq)
