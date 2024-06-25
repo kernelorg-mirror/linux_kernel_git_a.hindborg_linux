@@ -361,7 +361,7 @@ impl<const SIZE: usize> Deref for Bar<SIZE> {
 }
 
 impl Device {
-    fn as_raw(&self) -> *mut bindings::pci_dev {
+    pub fn as_raw(&self) -> *mut bindings::pci_dev {
         self.0.get()
     }
 
