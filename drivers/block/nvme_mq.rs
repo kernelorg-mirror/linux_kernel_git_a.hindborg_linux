@@ -301,6 +301,10 @@ where
         bindings::req_op_REQ_OP_DRV_IN
         | bindings::req_op_REQ_OP_DRV_OUT
         | bindings::req_op_REQ_OP_FLUSH => {
+            // TODO: We can get to this point before the queue rq has let go of
+            // the request, and then we will trigger the `expect`. Observed
+            // during probe on qemu.
+
             // We just complete right away if flush completes.
             mq::Request::end_ok(rq)
                 .map_err(|_e| kernel::error::code::EIO)
