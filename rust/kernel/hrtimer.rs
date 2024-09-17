@@ -428,3 +428,4 @@ macro_rules! impl_has_timer {
 }
 
 mod arc;
+mod pin;
