@@ -3,9 +3,11 @@
 use super::{pin_init, tbox::BoxTimerHandle, Timer, TimerCallback, TimerPointer, TimerRestart};
 use crate::{
     alloc::{flags, Flags},
-    impl_has_timer, new_mutex,
+    impl_has_timer,
+    irq::IrqDisabled,
+    new_spinlock_irq,
     prelude::*,
-    sync::Mutex,
+    sync::SpinLockIrq,
     time::Ktime,
 };
 use macros::pin_data;
@@ -15,7 +17,7 @@ pub struct ClosureTimer<T> {
     #[pin]
     timer: Timer<ClosureTimer<T>>,
     #[pin]
-    callback: Mutex<Option<T>>,
+    callback: SpinLockIrq<Option<T>>,
 }
 
 impl_has_timer! {
@@ -24,17 +26,17 @@ impl_has_timer! {
 
 impl<T> TimerCallback for ClosureTimer<T>
 where
-    T: FnOnce() + 'static,
+    T: FnOnce(IrqDisabled<'_>) + 'static,
 {
     type CallbackTarget<'a> = Pin<Box<ClosureTimer<T>>>;
     type CallbackTargetParameter<'a> = &'a ClosureTimer<T>;
 
-    fn run(this: Self::CallbackTargetParameter<'_>) -> TimerRestart
+    fn run(this: Self::CallbackTargetParameter<'_>, irq: IrqDisabled<'_>) -> TimerRestart
     where
         Self: Sized,
     {
-        if let Some(callback) = this.callback.lock().take() {
-            callback();
+        if let Some(callback) = this.callback.lock_with(irq).take() {
+            callback(irq);
         }
         TimerRestart::NoRestart
     }
@@ -42,7 +44,7 @@ where
 
 impl<T> ClosureTimer<T>
 where
-    T: FnOnce() + 'static,
+    T: FnOnce(IrqDisabled<'_>) + 'static,
     T: Send,
     T: Sync,
 {
@@ -51,7 +53,7 @@ where
             pin_init!(
                 Self {
                     timer <- Timer::new(super::TimerMode::Relative, super::ClockSource::Monotonic),
-                    callback <- new_mutex!(Some(f)),
+                    callback <- new_spinlock_irq!(Some(f)),
                 }
             ),
             flags,
@@ -62,7 +64,7 @@ where
 /// Start a timer that executes `f` after `expires` time.
 pub fn start_function<T>(expires: Ktime, f: T) -> Result<BoxTimerHandle<ClosureTimer<T>>>
 where
-    T: FnOnce() + 'static,
+    T: FnOnce(IrqDisabled<'_>) + 'static,
     T: Send,
     T: Sync,
 {

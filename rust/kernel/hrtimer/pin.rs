@@ -6,6 +6,7 @@ use super::Timer;
 use super::TimerCallback;
 use super::TimerHandle;
 use super::UnsafeTimerPointer;
+use crate::irq::IrqDisabled;
 use crate::time::Ktime;
 use core::pin::Pin;
 
@@ -92,6 +93,8 @@ where
         // here.
         let receiver_pin = unsafe { Pin::new_unchecked(receiver_ref) };
 
-        U::run(receiver_pin).into()
+        // SAFETY: By C API contract, interrupts are disabled when this function
+        // is called.
+        U::run(receiver_pin, unsafe { IrqDisabled::new() }).into()
     }
 }

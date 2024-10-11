@@ -6,6 +6,7 @@ use super::Timer;
 use super::TimerCallback;
 use super::TimerHandle;
 use super::TimerPointer;
+use crate::irq::IrqDisabled;
 use crate::prelude::*;
 use crate::time::Ktime;
 use core::mem::ManuallyDrop;
@@ -90,6 +91,8 @@ where
         let tbox = ManuallyDrop::new(unsafe { Box::from_raw(data_ptr) });
 
         use core::ops::Deref;
-        U::run(tbox.deref()).into()
+        // SAFETY: By C API contract, interrupts are disabled when this function
+        // is called.
+        U::run(tbox.deref(), unsafe { IrqDisabled::new() }).into()
     }
 }

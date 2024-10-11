@@ -35,9 +35,10 @@
 //! ```
 //! use kernel::{
 //!     hrtimer::{ClockSource, Timer, TimerCallback, TimerMode, TimerPointer, TimerRestart},
-//!     impl_has_timer, new_condvar, new_mutex,
+//!     impl_has_timer, new_condvar, new_spinlock, new_spinlock_irq,
+//!     irq::IrqDisabled,
 //!     prelude::*,
-//!     sync::{Arc, ArcBorrow, CondVar, Mutex},
+//!     sync::{Arc, ArcBorrow, CondVar, SpinLock, SpinLockIrq},
 //!     time::Ktime,
 //! };
 //!
@@ -46,7 +47,7 @@
 //!     #[pin]
 //!     timer: Timer<Self>,
 //!     #[pin]
-//!     flag: Mutex<u64>,
+//!     flag: SpinLockIrq<u64>,
 //!     #[pin]
 //!     cond: CondVar,
 //! }
@@ -55,7 +56,7 @@
 //!     fn new() -> impl PinInit<Self, kernel::error::Error> {
 //!         try_pin_init!(Self {
 //!             timer <- Timer::new(TimerMode::Relative, ClockSource::Monotonic),
-//!             flag <- new_mutex!(0),
+//!             flag <- new_spinlock_irq!(0),
 //!             cond <- new_condvar!(),
 //!         })
 //!     }
@@ -65,9 +66,9 @@
 //!     type CallbackTarget<'a> = Arc<Self>;
 //!     type CallbackTargetParameter<'a> = ArcBorrow<'a, Self>;
 //!
-//!     fn run(this: Self::CallbackTargetParameter<'_>) -> TimerRestart {
+//!     fn run(this: Self::CallbackTargetParameter<'_>, irq: IrqDisabled<'_>) -> TimerRestart {
 //!         pr_info!("Timer called\n");
-//!         let mut guard = this.flag.lock();
+//!         let mut guard = this.flag.lock_with(irq);
 //!         *guard += 1;
 //!         this.cond.notify_all();
 //!         if *guard == 5 {
@@ -87,24 +88,27 @@
 //!
 //! let has_timer = Arc::pin_init(ArcIntrusiveTimer::new(), GFP_KERNEL)?;
 //! let _handle = has_timer.clone().start(Ktime::from_ns(200_000_000));
-//! let mut guard = has_timer.flag.lock();
 //!
-//! while *guard != 5 {
-//!     has_timer.cond.wait(&mut guard);
-//! }
+//! kernel::irq::with_irqs_disabled(|irq| {
+//!   let mut guard = has_timer.flag.lock_with(irq);
+//!
+//!   while *guard != 5 {
+//!       has_timer.cond.wait(&mut guard);
+//!   }
+//! });
 //!
 //! pr_info!("Counted to 5\n");
 //! # Ok::<(), kernel::error::Error>(())
 //! ```
 //!
 //! Using a stack based timer:
-//! ```
+//! ```no_run
 //! use kernel::{
 //!     hrtimer::{ClockSource, Timer, TimerCallback, TimerMode, ScopedTimerPointer, TimerRestart},
-//!     impl_has_timer, new_condvar, new_mutex,
+//!     impl_has_timer, new_condvar, new_spinlock_irq,
 //!     prelude::*,
 //!     stack_try_pin_init,
-//!     sync::{CondVar, Mutex},
+//!     sync::{CondVar, SpinLockIrq},
 //!     time::Ktime,
 //! };
 //!
@@ -113,7 +117,7 @@
 //!     #[pin]
 //!     timer: Timer<Self>,
 //!     #[pin]
-//!     flag: Mutex<bool>,
+//!     flag: SpinLockIrq<bool>,
 //!     #[pin]
 //!     cond: CondVar,
 //! }
@@ -122,7 +126,7 @@
 //!     fn new() -> impl PinInit<Self, kernel::error::Error> {
 //!         try_pin_init!(Self {
 //!             timer <- Timer::new(TimerMode::Relative, ClockSource::Monotonic),
-//!             flag <- new_mutex!(false),
+//!             flag <- new_spinlock_irq!(false),
 //!             cond <- new_condvar!(),
 //!         })
 //!     }
@@ -132,9 +136,9 @@
 //!     type CallbackTarget<'a> = Pin<&'a Self>;
 //!     type CallbackTargetParameter<'a> = Pin<&'a Self>;
 //!
-//!     fn run(this: Self::CallbackTarget<'_>) -> TimerRestart {
+//!     fn run(this: Self::CallbackTarget<'_>, irq: kernel::irq::IrqDisabled<'_>) -> TimerRestart {
 //!         pr_info!("Timer called\n");
-//!         *this.flag.lock() = true;
+//!         *this.flag.lock_with(irq) = true;
 //!         this.cond.notify_all();
 //!         TimerRestart::NoRestart
 //!     }
@@ -147,11 +151,13 @@
 //!
 //! stack_try_pin_init!( let has_timer =? IntrusiveTimer::new() );
 //! has_timer.as_ref().start_scoped(Ktime::from_ns(200_000_000), || {
-//!     let mut guard = has_timer.flag.lock();
+//!     kernel::irq::with_irqs_disabled(|irq| {
+//!         let mut guard = has_timer.flag.lock_with(irq);
 //!
-//!     while !*guard {
-//!         has_timer.cond.wait(&mut guard);
-//!     }
+//!         while !*guard {
+//!             has_timer.cond.wait(&mut guard);
+//!         }
+//!     });
 //! });
 //!
 //! pr_info!("Flag raised\n");
@@ -159,20 +165,20 @@
 //! ```
 //!
 //! Using a helper:
-//! ```
+//! ```no_run
 //! use kernel::{
 //!     hrtimer::start_function,
-//!     impl_has_timer, new_condvar, new_mutex,
+//!     impl_has_timer, new_condvar, new_spinlock_irq,
 //!     prelude::*,
 //!     stack_try_pin_init,
-//!     sync::{Arc, CondVar, Mutex},
+//!     sync::{Arc, CondVar, SpinLockIrq},
 //!     time::Ktime,
 //! };
 //!
 //! #[pin_data]
 //! struct Data {
 //!     #[pin]
-//!     flag: Mutex<bool>,
+//!     flag: SpinLockIrq<bool>,
 //!     #[pin]
 //!     cond: CondVar,
 //! }
@@ -180,7 +186,7 @@
 //! impl Data {
 //!     fn new() -> impl PinInit<Self, kernel::error::Error> {
 //!         try_pin_init!(Self {
-//!             flag <- new_mutex!(false),
+//!             flag <- new_spinlock_irq!(false),
 //!             cond <- new_condvar!(),
 //!         })
 //!     }
@@ -189,21 +195,24 @@
 //! let data = Arc::pin_init(Data::new(), GFP_KERNEL)?;
 //! let data2 = data.clone();
 //!
-//! let handle = start_function(Ktime::from_ns(200_000_000), move || {
+//! let handle = start_function(Ktime::from_ns(200_000_000), move |irq| {
 //!     pr_info!("Hello from the future");
-//!     *data2.flag.lock() = true;
+//!     *data2.flag.lock_with(irq) = true;
 //!     data2.cond.notify_all();
 //! });
 //!
-//! let mut guard = data.flag.lock();
-//! while !*guard {
-//!     data.cond.wait(&mut guard);
-//! }
+//! kernel::irq::with_irqs_disabled(|irq| {
+//!     let mut guard = data.flag.lock_with(irq);
+//!     while !*guard {
+//!         data.cond.wait(&mut guard);
+//!     }
+//! });
 //!
 //! pr_info!("Flag raised\n");
 //! # Ok::<(), kernel::error::Error>(())
 //! ```
 
+use crate::irq::IrqDisabled;
 use crate::{init::PinInit, prelude::*, time::Ktime, types::Opaque};
 use core::marker::PhantomData;
 
@@ -417,7 +426,7 @@ pub trait TimerCallback {
     type CallbackTargetParameter<'a>;
 
     /// Called by the timer logic when the timer fires.
-    fn run(this: Self::CallbackTargetParameter<'_>) -> TimerRestart
+    fn run(this: Self::CallbackTargetParameter<'_>, irq: IrqDisabled<'_>) -> TimerRestart
     where
         Self: Sized;
 }
