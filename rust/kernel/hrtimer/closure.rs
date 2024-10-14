@@ -50,7 +50,7 @@ where
         Box::pin_init(
             pin_init!(
                 Self {
-                    timer <- Timer::new(super::TimerMode::Relative),
+                    timer <- Timer::new(super::TimerMode::Relative, super::ClockSource::Monotonic),
                     callback <- new_mutex!(Some(f)),
                 }
             ),
