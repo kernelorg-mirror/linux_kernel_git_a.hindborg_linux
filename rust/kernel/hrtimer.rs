@@ -96,6 +96,67 @@
 //! pr_info!("Counted to 5\n");
 //! # Ok::<(), kernel::error::Error>(())
 //! ```
+//!
+//! Using a stack based timer:
+//! ```
+//! use kernel::{
+//!     hrtimer::{Timer, TimerCallback, ScopedTimerPointer, TimerRestart},
+//!     impl_has_timer, new_condvar, new_mutex,
+//!     prelude::*,
+//!     stack_try_pin_init,
+//!     sync::{CondVar, Mutex},
+//!     time::Ktime,
+//! };
+//!
+//! #[pin_data]
+//! struct IntrusiveTimer {
+//!     #[pin]
+//!     timer: Timer<Self>,
+//!     #[pin]
+//!     flag: Mutex<bool>,
+//!     #[pin]
+//!     cond: CondVar,
+//! }
+//!
+//! impl IntrusiveTimer {
+//!     fn new() -> impl PinInit<Self, kernel::error::Error> {
+//!         try_pin_init!(Self {
+//!             timer <- Timer::new(),
+//!             flag <- new_mutex!(false),
+//!             cond <- new_condvar!(),
+//!         })
+//!     }
+//! }
+//!
+//! impl TimerCallback for IntrusiveTimer {
+//!     type CallbackTarget<'a> = Pin<&'a Self>;
+//!     type CallbackTargetParameter<'a> = Pin<&'a Self>;
+//!
+//!     fn run(this: Self::CallbackTarget<'_>) -> TimerRestart {
+//!         pr_info!("Timer called\n");
+//!         *this.flag.lock() = true;
+//!         this.cond.notify_all();
+//!         TimerRestart::NoRestart
+//!     }
+//! }
+//!
+//! impl_has_timer! {
+//!     impl HasTimer<Self> for IntrusiveTimer { self.timer }
+//! }
+//!
+//!
+//! stack_try_pin_init!( let has_timer =? IntrusiveTimer::new() );
+//! has_timer.as_ref().start_scoped(Ktime::from_ns(200_000_000), || {
+//!     let mut guard = has_timer.flag.lock();
+//!
+//!     while !*guard {
+//!         has_timer.cond.wait(&mut guard);
+//!     }
+//! });
+//!
+//! pr_info!("Flag raised\n");
+//! # Ok::<(), kernel::error::Error>(())
+//! ```
 
 use crate::{init::PinInit, prelude::*, time::Ktime, types::Opaque};
 use core::marker::PhantomData;
