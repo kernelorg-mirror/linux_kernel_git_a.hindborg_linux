@@ -29,6 +29,65 @@
 //! Events:
 //!
 //! * Expire
+//!
+//! # Example
+//!
+//! ```
+//! use kernel::{
+//!     hrtimer::{Timer, TimerCallback, TimerPointer},
+//!     impl_has_timer, new_condvar, new_mutex,
+//!     prelude::*,
+//!     sync::{Arc, ArcBorrow, CondVar, Mutex},
+//!     time::Ktime,
+//! };
+//!
+//! #[pin_data]
+//! struct ArcIntrusiveTimer {
+//!     #[pin]
+//!     timer: Timer<Self>,
+//!     #[pin]
+//!     flag: Mutex<bool>,
+//!     #[pin]
+//!     cond: CondVar,
+//! }
+//!
+//! impl ArcIntrusiveTimer {
+//!     fn new() -> impl PinInit<Self, kernel::error::Error> {
+//!         try_pin_init!(Self {
+//!             timer <- Timer::new(),
+//!             flag <- new_mutex!(false),
+//!             cond <- new_condvar!(),
+//!         })
+//!     }
+//! }
+//!
+//! impl TimerCallback for ArcIntrusiveTimer {
+//!     type CallbackTarget<'a> = Arc<Self>;
+//!     type CallbackTargetParameter<'a> = ArcBorrow<'a, Self>;
+//!
+//!     fn run(this: Self::CallbackTarget<'_>) {
+//!         pr_info!("Timer called\n");
+//!         *this.flag.lock() = true;
+//!         this.cond.notify_all();
+//!     }
+//! }
+//!
+//! impl_has_timer! {
+//!     impl HasTimer<Self> for ArcIntrusiveTimer { self.timer }
+//! }
+//!
+//!
+//! let has_timer = Arc::pin_init(ArcIntrusiveTimer::new(), GFP_KERNEL)?;
+//! let _handle = has_timer.clone().start(Ktime::from_ns(200_000_000));
+//! let mut guard = has_timer.flag.lock();
+//!
+//! while !*guard {
+//!     has_timer.cond.wait(&mut guard);
+//! }
+//!
+//! pr_info!("Flag raised\n");
+//! # Ok::<(), kernel::error::Error>(())
+//! ```
 
 use crate::{init::PinInit, prelude::*, time::Ktime, types::Opaque};
 use core::marker::PhantomData;
