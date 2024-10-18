@@ -6,7 +6,6 @@ use super::Timer;
 use super::TimerCallback;
 use super::TimerHandle;
 use super::TimerPointer;
-use crate::irq::IrqDisabled;
 use crate::sync::Arc;
 use crate::sync::ArcBorrow;
 use crate::time::Ktime;
@@ -84,9 +83,6 @@ where
         let receiver = unsafe { ArcBorrow::from_raw(data_ptr) };
 
         debug_assert!(unsafe { bindings::irqs_disabled() });
-
-        // SAFETY: By C API contract, interrupts are disabled when this function
-        // is called.
-        U::run(receiver, unsafe { IrqDisabled::new() }).into()
+        U::run(receiver).into()
     }
 }

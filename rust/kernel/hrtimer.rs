@@ -36,7 +36,6 @@
 //! use kernel::{
 //!     hrtimer::{ClockSource, Timer, TimerCallback, TimerMode, TimerPointer, TimerRestart},
 //!     impl_has_timer, new_condvar, new_spinlock, new_spinlock_irq,
-//!     irq::IrqDisabled,
 //!     prelude::*,
 //!     sync::{Arc, ArcBorrow, CondVar, SpinLock, SpinLockIrq},
 //!     time::Ktime,
@@ -66,9 +65,9 @@
 //!     type CallbackTarget<'a> = Arc<Self>;
 //!     type CallbackTargetParameter<'a> = ArcBorrow<'a, Self>;
 //!
-//!     fn run(this: Self::CallbackTargetParameter<'_>, irq: IrqDisabled<'_>) -> TimerRestart {
+//!     fn run(this: Self::CallbackTargetParameter<'_>) -> TimerRestart {
 //!         pr_info!("Timer called\n");
-//!         let mut guard = this.flag.lock_with(irq);
+//!         let mut guard = this.flag.lock();
 //!         *guard += 1;
 //!         this.cond.notify_all();
 //!         if *guard == 5 {
@@ -88,14 +87,11 @@
 //!
 //! let has_timer = Arc::pin_init(ArcIntrusiveTimer::new(), GFP_KERNEL)?;
 //! let _handle = has_timer.clone().start(Ktime::from_ns(200_000_000));
+//! let mut guard = has_timer.flag.lock();
 //!
-//! kernel::irq::with_irqs_disabled(|irq| {
-//!   let mut guard = has_timer.flag.lock_with(irq);
-//!
-//!   while *guard != 5 {
-//!       has_timer.cond.wait(&mut guard);
-//!   }
-//! });
+//! while *guard != 5 {
+//!     has_timer.cond.wait(&mut guard);
+//! }
 //!
 //! pr_info!("Counted to 5\n");
 //! # Ok::<(), kernel::error::Error>(())
@@ -136,9 +132,9 @@
 //!     type CallbackTarget<'a> = Pin<&'a Self>;
 //!     type CallbackTargetParameter<'a> = Pin<&'a Self>;
 //!
-//!     fn run(this: Self::CallbackTarget<'_>, irq: kernel::irq::IrqDisabled<'_>) -> TimerRestart {
+//!     fn run(this: Self::CallbackTarget<'_>) -> TimerRestart {
 //!         pr_info!("Timer called\n");
-//!         *this.flag.lock_with(irq) = true;
+//!         *this.flag.lock() = true;
 //!         this.cond.notify_all();
 //!         TimerRestart::NoRestart
 //!     }
@@ -151,13 +147,11 @@
 //!
 //! stack_try_pin_init!( let has_timer =? IntrusiveTimer::new() );
 //! has_timer.as_ref().start_scoped(Ktime::from_ns(200_000_000), || {
-//!     kernel::irq::with_irqs_disabled(|irq| {
-//!         let mut guard = has_timer.flag.lock_with(irq);
+//!     let mut guard = has_timer.flag.lock();
 //!
-//!         while !*guard {
-//!             has_timer.cond.wait(&mut guard);
-//!         }
-//!     });
+//!     while !*guard {
+//!         has_timer.cond.wait(&mut guard);
+//!     }
 //! });
 //!
 //! pr_info!("Flag raised\n");
@@ -195,24 +189,21 @@
 //! let data = Arc::pin_init(Data::new(), GFP_KERNEL)?;
 //! let data2 = data.clone();
 //!
-//! let handle = start_function(Ktime::from_ns(200_000_000), move |irq| {
+//! let handle = start_function(Ktime::from_ns(200_000_000), move || {
 //!     pr_info!("Hello from the future");
-//!     *data2.flag.lock_with(irq) = true;
+//!     *data2.flag.lock() = true;
 //!     data2.cond.notify_all();
 //! });
 //!
-//! kernel::irq::with_irqs_disabled(|irq| {
-//!     let mut guard = data.flag.lock_with(irq);
-//!     while !*guard {
-//!         data.cond.wait(&mut guard);
-//!     }
-//! });
+//! let mut guard = data.flag.lock();
+//! while !*guard {
+//!     data.cond.wait(&mut guard);
+//! }
 //!
 //! pr_info!("Flag raised\n");
 //! # Ok::<(), kernel::error::Error>(())
 //! ```
 
-use crate::irq::IrqDisabled;
 use crate::{init::PinInit, prelude::*, time::Ktime, types::Opaque};
 use core::marker::PhantomData;
 
@@ -426,7 +417,7 @@ pub trait TimerCallback {
     type CallbackTargetParameter<'a>;
 
     /// Called by the timer logic when the timer fires.
-    fn run(this: Self::CallbackTargetParameter<'_>, irq: IrqDisabled<'_>) -> TimerRestart
+    fn run(this: Self::CallbackTargetParameter<'_>) -> TimerRestart
     where
         Self: Sized;
 }
