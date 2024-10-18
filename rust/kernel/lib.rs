@@ -36,6 +36,7 @@ pub mod error;
 pub mod firmware;
 pub mod hrtimer;
 pub mod init;
+pub mod interrupt;
 pub mod ioctl;
 #[cfg(CONFIG_KUNIT)]
 pub mod kunit;
