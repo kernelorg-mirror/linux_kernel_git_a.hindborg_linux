@@ -114,6 +114,17 @@ impl PartialEq for BStr {
     }
 }
 
+impl<Idx> Index<Idx> for BStr
+where
+    Idx: core::slice::SliceIndex<[u8], Output = [u8]>,
+{
+    type Output = Self;
+
+    fn index(&self, index: Idx) -> &Self::Output {
+        BStr::from_bytes(&self.0[index])
+    }
+}
+
 /// Creates a new [`BStr`] from a string literal.
 ///
 /// `b_str!` converts the supplied string literal to byte string, so non-ASCII
