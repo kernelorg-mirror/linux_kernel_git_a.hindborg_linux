@@ -63,10 +63,12 @@ impl<T: Driver + 'static> Adapter<T> {
         let info = <Self as driver::Adapter>::id_info(pdev.as_ref());
         match T::probe(&mut pdev, info) {
             Ok(data) => {
+                let data = data.into_foreign();
+                let data = data.cast();
                 // Let the `struct platform_device` own a reference of the driver's private data.
                 // SAFETY: By the type invariant `pdev.as_raw` returns a valid pointer to a
                 // `struct platform_device`.
-                unsafe { bindings::platform_set_drvdata(pdev.as_raw(), data.into_foreign() as _) };
+                unsafe { bindings::platform_set_drvdata(pdev.as_raw(), data) };
             }
             Err(err) => return Error::to_errno(err),
         }
@@ -77,6 +79,7 @@ impl<T: Driver + 'static> Adapter<T> {
     extern "C" fn remove_callback(pdev: *mut bindings::platform_device) {
         // SAFETY: `pdev` is a valid pointer to a `struct platform_device`.
         let ptr = unsafe { bindings::platform_get_drvdata(pdev) };
+        let ptr = ptr.cast();
 
         // SAFETY: `remove_callback` is only ever called after a successful call to
         // `probe_callback`, hence it's guaranteed that `ptr` points to a valid and initialized
