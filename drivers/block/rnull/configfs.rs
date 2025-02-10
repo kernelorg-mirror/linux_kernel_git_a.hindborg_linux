@@ -60,7 +60,10 @@ impl AttributeOperations<0> for Config {
 
     fn show(_this: &Config, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
         let mut writer = kernel::str::Formatter::new(page);
-        writer.write_str("blocksize,size,rotational,irqmode,completion_nsec,memory_backed\n")?;
+        writer.write_str(
+            "blocksize,size,rotational,irqmode,completion_nsec,memory_backed,\
+             submit_queues\n",
+        )?;
         Ok(writer.bytes_written())
     }
 }
@@ -85,6 +88,7 @@ impl configfs::GroupOperations for Config {
                 irqmode: 4,
                 completion_nsec: 5,
                 memory_backed: 6,
+                submit_queues: 7,
             ],
         };
 
@@ -103,6 +107,7 @@ impl configfs::GroupOperations for Config {
                     completion_time: time::Delta::ZERO,
                     name: name.try_into()?,
                     memory_backed: false,
+                    submit_queues: 1,
                 }),
             }),
             core::iter::empty(),
@@ -168,6 +173,7 @@ struct DeviceConfigInner {
     completion_time: time::Delta,
     disk: Option<GenDisk<NullBlkDevice>>,
     memory_backed: bool,
+    submit_queues: u32,
 }
 
 #[vtable]
@@ -191,15 +197,16 @@ impl configfs::AttributeOperations<0> for DeviceConfig {
         let mut guard = this.data.lock();
 
         if !guard.powered && power_op {
-            guard.disk = Some(NullBlkDevice::new(
-                &guard.name,
-                guard.block_size,
-                guard.rotational,
-                guard.capacity_mib,
-                guard.irq_mode,
-                guard.completion_time,
-                guard.memory_backed,
-            )?);
+            guard.disk = Some(NullBlkDevice::new(crate::NullBlkOptions {
+                name: &guard.name,
+                block_size: guard.block_size,
+                rotational: guard.rotational,
+                capacity_mib: guard.capacity_mib,
+                irq_mode: guard.irq_mode,
+                completion_time: guard.completion_time,
+                memory_backed: guard.memory_backed,
+                submit_queues: guard.submit_queues,
+            })?);
             guard.powered = true;
         } else if guard.powered && !power_op {
             drop(guard.disk.take());
@@ -232,3 +239,32 @@ impl core::str::FromStr for IRQMode {
 }
 
 configfs_simple_bool_field!(DeviceConfig, 6, memory_backed);
+
+#[vtable]
+impl configfs::AttributeOperations<7> for DeviceConfig {
+    type Data = DeviceConfig;
+
+    fn show(this: &DeviceConfig, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        let mut writer = kernel::str::Formatter::new(page);
+        writer.write_fmt(fmt!("{}\n", this.data.lock().submit_queues))?;
+        Ok(writer.bytes_written())
+    }
+
+    fn store(this: &DeviceConfig, page: &[u8]) -> Result {
+        if this.data.lock().powered {
+            return Err(EBUSY);
+        }
+
+        let text = core::str::from_utf8(page)?.trim();
+        let value = text
+            .parse::<u32>()
+            .map_err(|_| kernel::error::code::EINVAL)?;
+
+        if value == 0 || value > kernel::cpu::num_possible_cpus() {
+            return Err(kernel::error::code::EINVAL);
+        }
+
+        this.data.lock().submit_queues = value;
+        Ok(())
+    }
+}
