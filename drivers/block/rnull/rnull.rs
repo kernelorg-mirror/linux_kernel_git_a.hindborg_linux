@@ -20,7 +20,10 @@ use kernel::{
             TagSet, //
         },
     },
-    error::Result,
+    error::{
+        code,
+        Result, //
+    },
     memalloc_scope,
     new_mutex,
     new_xarray,
@@ -93,6 +96,10 @@ module! {
             default: false,
             description: "Use per-node allocation for hardware context queues.",
         },
+        home_node: i32 {
+            default: -1,
+            description: "Home node for the device. Default: -1 (no node)",
+        },
     },
 }
 
@@ -129,6 +136,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                     completion_time: Delta::from_nanos(completion_time),
                     memory_backed: module_parameters::memory_backed.value(),
                     submit_queues,
+                    home_node: module_parameters::home_node.value(),
                 })?;
                 disks.push(disk, GFP_KERNEL)?;
             }
@@ -152,6 +160,7 @@ struct NullBlkOptions<'a> {
     completion_time: Delta,
     memory_backed: bool,
     submit_queues: u32,
+    home_node: i32,
 }
 struct NullBlkDevice;
 
@@ -166,6 +175,7 @@ impl NullBlkDevice {
             completion_time,
             memory_backed,
             submit_queues,
+            home_node,
         } = options;
 
         let flags = if memory_backed {
@@ -174,14 +184,18 @@ impl NullBlkDevice {
             mq::tag_set::Flags::default()
         };
 
+        if home_node > kernel::numa::num_online_nodes().try_into()? {
+            return Err(code::EINVAL);
+        }
+
+        let numa_node = if home_node == -1 {
+            kernel::alloc::NumaNode::NO_NODE
+        } else {
+            kernel::alloc::NumaNode::new(home_node)?
+        };
+
         let tagset = Arc::pin_init(
-            TagSet::new(
-                submit_queues,
-                256,
-                1,
-                kernel::alloc::NumaNode::NO_NODE,
-                flags,
-            ),
+            TagSet::new(submit_queues, 256, 1, numa_node, flags),
             GFP_KERNEL,
         )?;
 
