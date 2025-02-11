@@ -18,7 +18,7 @@ use kernel::{
             Operations, TagSet,
         },
     },
-    error::Result,
+    error::{code, Result},
     new_mutex, new_spinlock,
     page::Page,
     prelude::*,
@@ -74,6 +74,10 @@ module! {
             default: 0,
             description:  "Use per-node allocation for hardware context queues, 0-false, 1-true. Default: 0-false",
         },
+        home_node: i32 {
+            default: -1,
+            description: "Home node for the device. Default: -1 (no node)",
+        },
     },
 }
 
@@ -111,6 +115,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                     Ktime::from_nanos(completion_time),
                     *module_parameters::memory_backed.value() != 0,
                     submit_queues,
+                    *module_parameters::home_node.value(),
                 )?;
                 disks.push(disk, flags::GFP_KERNEL)?;
             }
@@ -137,9 +142,14 @@ impl NullBlkDevice {
         completion_time: Ktime,
         memory_backed: bool,
         submit_queues: u32,
+        home_node: i32,
     ) -> Result<GenDisk<Self>> {
+        if home_node > kernel::num_online_nodes().try_into()? {
+            return Err(code::EINVAL);
+        }
+
         let tagset = Arc::pin_init(
-            TagSet::new(submit_queues, 256, 1, bindings::NUMA_NO_NODE),
+            TagSet::new(submit_queues, 256, 1, home_node),
             flags::GFP_KERNEL,
         )?;
 
