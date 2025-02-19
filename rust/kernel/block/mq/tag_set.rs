@@ -98,6 +98,7 @@ impl<T: Operations> TagSet<T> {
         unsafe { &*(ptr.cast::<Self>()) }
     }
 
+    // TODO: Must handle existence of unique ref
     pub fn tag_to_rq(&self, qid: u32, tag: u32) -> Option<ARef<Request<T>>> {
         // TODO: We have to check that qid doesn't overflow hw queue.
         let tags = unsafe { *(*self.inner.get()).tags.add(qid as _) };
