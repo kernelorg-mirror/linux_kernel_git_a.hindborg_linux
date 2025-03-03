@@ -18,13 +18,13 @@ use crate::{
     types::{ARef, ForeignOwnable, Opaque},
     ThisModule,
 };
+use core::fmt;
 use core::{
     marker::PhantomData,
     ops::Deref,
     ptr::{addr_of_mut, NonNull},
 };
 use kernel::prelude::*;
-use core::fmt;
 use kernel::prelude::*;
 
 /// An adapter for the registration of PCI drivers.
@@ -408,11 +408,6 @@ impl Device {
     /// Mapps an entire PCI-BAR after performing a region-request on it.
     pub fn iomap_region(&self, bar: u32, name: &CStr) -> Result<Devres<Bar>> {
         self.iomap_region_sized::<0>(bar, name)
-    }
-
-    /// Returns a new `ARef` of the base `device::Device`.
-    pub fn as_dev(&self) -> ARef<device::Device> {
-        self.0.clone()
     }
 
     // TODO: check that all these &self methods use internal synchronization
