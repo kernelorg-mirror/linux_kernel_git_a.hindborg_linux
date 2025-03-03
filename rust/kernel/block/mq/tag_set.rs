@@ -9,13 +9,14 @@ use core::pin::Pin;
 use crate::{
     bindings,
     block::mq::{operations::OperationsVTable, request::RequestDataWrapper, Operations},
-    error,
-    prelude::PinInit,
+    error::{self, Result},
+    pr_info,
+    prelude::{PinInit, EINVAL},
     try_pin_init,
     types::{ARef, ForeignOwnable, Opaque},
 };
-use core::{convert::TryInto, marker::PhantomData, ptr::NonNull};
 use core::sync::atomic::Ordering;
+use core::{convert::TryInto, marker::PhantomData, ptr::NonNull};
 use macros::{pin_data, pinned_drop};
 
 use super::Request;
@@ -96,6 +97,47 @@ impl<T: Operations> TagSet<T> {
         // SAFETY: By the safety requirements of this function, `ptr` is valid
         // for use as a reference for the duration of `'a`.
         unsafe { &*(ptr.cast::<Self>()) }
+    }
+
+    pub fn tag_to_rq(&self, qid: u32, tag: u32) -> Option<ARef<Request<T>>> {
+        // TODO: We have to check that qid doesn't overflow hw queue.
+        let tags = unsafe { *(*self.inner.get()).tags.add(qid as _) };
+        let rq_ptr = unsafe { bindings::blk_mq_tag_to_rq(tags, tag) };
+        if rq_ptr.is_null() {
+            None
+        } else {
+            let refcount_ptr = unsafe {
+                RequestDataWrapper::refcount_ptr(
+                    Request::wrapper_ptr(rq_ptr.cast::<Request<T>>()).as_ptr(),
+                )
+            };
+            let refcount_ref = unsafe { &*refcount_ptr };
+
+            // It is possible for an interrupt to arrive faster than the last
+            // decrement to the refcount, so retry if the refcount is not what
+            // we think it should be.
+            while let Err(_) =
+                // Load acquire to sync with store release of URef being destroyed
+                // (prevent mutable access overlapping) this load.
+                // Store relaxed as no other operations need to happen strictly
+                // before or after the increment.
+                refcount_ref.as_atomic().fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Acquire,
+                    |x| {
+                        if x >= 1 {
+                            Some(x + 1)
+                        } else {
+                            None
+                        }
+                    },
+                )
+            {
+                core::hint::spin_loop();
+            }
+
+            Some(unsafe { Request::aref_from_raw(rq_ptr) })
+        }
     }
 }
 
