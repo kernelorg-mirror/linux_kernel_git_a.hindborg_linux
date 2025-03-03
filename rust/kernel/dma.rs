@@ -5,13 +5,17 @@
 //! C header: [`include/linux/dma-mapping.h`](srctree/include/linux/dma-mapping.h)
 
 use crate::{
+    alloc::flags,
     bindings, build_assert,
     device::Device,
     error::code::*,
     error::Result,
+    str::CStr,
+    sync::Arc,
     transmute::{AsBytes, FromBytes},
     types::ARef,
 };
+use core::marker::PhantomData;
 
 /// Possible attributes associated with a DMA mapping.
 ///
@@ -23,12 +27,12 @@ use crate::{
 ///
 /// ```
 /// use kernel::device::Device;
-/// use kernel::dma::{attrs::*, CoherentAllocation};
+/// use kernel::dma::{attrs::*, CoherentAllocation, CoherentAllocator};
 ///
 /// # fn test(dev: &Device) -> Result {
 /// let attribs = DMA_ATTR_FORCE_CONTIGUOUS | DMA_ATTR_NO_WARN;
-/// let c: CoherentAllocation<u64> =
-///     CoherentAllocation::alloc_attrs(dev, 4, GFP_KERNEL, attribs)?;
+/// let c: CoherentAllocation<u64, kernel::dma::CoherentAllocator> =
+///     CoherentAllocator::alloc_attrs(dev.into(), 4, GFP_KERNEL, attribs)?;
 /// # Ok::<(), Error>(()) }
 /// ```
 #[derive(Clone, Copy, PartialEq)]
@@ -102,6 +106,21 @@ pub mod attrs {
     pub const DMA_ATTR_PRIVILEGED: Attrs = Attrs(bindings::DMA_ATTR_PRIVILEGED);
 }
 
+pub trait Allocator {
+    type AllocationData;
+    type DataSource;
+
+    fn free(
+        cpu_addr: *mut crate::ffi::c_void,
+        dma_handle: u64,
+        size: usize,
+        alloc_data: &Self::AllocationData,
+        attrs: Attrs,
+    );
+
+    unsafe fn allocation_data(data: &Self::DataSource) -> Self::AllocationData;
+}
+
 /// An abstraction of the `dma_alloc_coherent` API.
 ///
 /// This is an abstraction around the `dma_alloc_coherent` API which is used to allocate and map
@@ -129,76 +148,46 @@ pub mod attrs {
 //
 // Hence, find a way to revoke the device resources of a `CoherentAllocation`, but not the
 // entire `CoherentAllocation` including the allocated memory itself.
-pub struct CoherentAllocation<T: AsBytes + FromBytes> {
-    dev: ARef<Device>,
+pub struct CoherentAllocation<T: AsBytes + FromBytes, A: Allocator> {
+    dev: A::AllocationData,
     dma_handle: bindings::dma_addr_t,
     count: usize,
     cpu_addr: *mut T,
     dma_attrs: Attrs,
+    _p: PhantomData<A>,
 }
 
-impl<T: AsBytes + FromBytes> CoherentAllocation<T> {
-    /// Allocates a region of `size_of::<T> * count` of consistent memory.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use kernel::device::Device;
-    /// use kernel::dma::{attrs::*, CoherentAllocation};
-    ///
-    /// # fn test(dev: &Device) -> Result {
-    /// let c: CoherentAllocation<u64> =
-    ///     CoherentAllocation::alloc_attrs(dev, 4, GFP_KERNEL, DMA_ATTR_NO_WARN)?;
-    /// # Ok::<(), Error>(()) }
-    /// ```
-    pub fn alloc_attrs(
-        dev: &Device,
+impl<T: AsBytes + FromBytes, A: Allocator> CoherentAllocation<T, A> {
+    fn new(
+        cpu_addr: *mut T,
+        dma_handle: u64,
         count: usize,
-        gfp_flags: kernel::alloc::Flags,
+        alloc_data: A::AllocationData,
         dma_attrs: Attrs,
-    ) -> Result<CoherentAllocation<T>> {
-        build_assert!(
-            core::mem::size_of::<T>() > 0,
-            "It doesn't make sense for the allocated type to be a ZST"
-        );
-
-        let size = count
-            .checked_mul(core::mem::size_of::<T>())
-            .ok_or(EOVERFLOW)?;
-        let mut dma_handle = 0;
-        // SAFETY: Device pointer is guaranteed as valid by the type invariant on `Device`.
-        let ret = unsafe {
-            bindings::dma_alloc_attrs(
-                dev.as_raw(),
-                size,
-                &mut dma_handle,
-                gfp_flags.as_raw(),
-                dma_attrs.as_raw(),
-            )
-        };
-        if ret.is_null() {
-            return Err(ENOMEM);
-        }
-        // INVARIANT: We just successfully allocated a coherent region which is accessible for
-        // `count` elements, hence the cpu address is valid. We also hold a refcounted reference
-        // to the device.
-        Ok(Self {
-            dev: dev.into(),
+    ) -> Self {
+        Self {
+            dev: alloc_data,
             dma_handle,
             count,
-            cpu_addr: ret as *mut T,
+            cpu_addr,
             dma_attrs,
-        })
+            _p: PhantomData,
+        }
     }
 
-    /// Performs the same functionality as [`CoherentAllocation::alloc_attrs`], except the
-    /// `dma_attrs` is 0 by default.
-    pub fn alloc_coherent(
-        dev: &Device,
-        count: usize,
-        gfp_flags: kernel::alloc::Flags,
-    ) -> Result<CoherentAllocation<T>> {
-        CoherentAllocation::alloc_attrs(dev, count, gfp_flags, Attrs(0))
+    /// Create a duplicate of the `CoherentAllocation` object but prevent it from being dropped.
+    pub fn skip_drop(self) -> CoherentAllocation<T, A> {
+        let me = core::mem::ManuallyDrop::new(self);
+        Self {
+            // SAFETY: The refcount of `dev` will not be decremented because this doesn't actually
+            // duplicafe `ARef` and the use of `ManuallyDrop` forgets the originals.
+            dev: unsafe { core::ptr::read(&me.dev) },
+            dma_handle: me.dma_handle,
+            count: me.count,
+            cpu_addr: me.cpu_addr,
+            dma_attrs: me.dma_attrs,
+            _p: PhantomData,
+        }
     }
 
     /// Returns the base address to the allocated region in the CPU's virtual address space.
@@ -216,6 +205,24 @@ impl<T: AsBytes + FromBytes> CoherentAllocation<T> {
     /// the region.
     pub fn dma_handle(&self) -> bindings::dma_addr_t {
         self.dma_handle
+    }
+
+    pub unsafe fn from_parts(
+        data: &A::DataSource,
+        ptr: usize,
+        dma_handle: u64,
+        count: usize,
+    ) -> Self {
+        Self {
+            dma_handle,
+            count,
+            cpu_addr: ptr as _,
+            // SAFETY: The safety requirements of the current function satisfy those of
+            // `allocation_data`.
+            dev: unsafe { A::allocation_data(data) },
+            dma_attrs: Attrs(0),
+            _p: PhantomData,
+        }
     }
 
     /// Returns a pointer to an element from the region with bounds checking. `offset` is in
@@ -282,28 +289,12 @@ impl<T: AsBytes + FromBytes> CoherentAllocation<T> {
     }
 }
 
-/// Note that the device configured to do DMA must be halted before this object is dropped.
-impl<T: AsBytes + FromBytes> Drop for CoherentAllocation<T> {
-    fn drop(&mut self) {
-        let size = self.count * core::mem::size_of::<T>();
-        // SAFETY: Device pointer is guaranteed as valid by the type invariant on `Device`.
-        // The cpu address, and the dma handle are valid due to the type invariants on
-        // `CoherentAllocation`.
-        unsafe {
-            bindings::dma_free_attrs(
-                self.dev.as_raw(),
-                size,
-                self.cpu_addr as _,
-                self.dma_handle,
-                self.dma_attrs.as_raw(),
-            )
-        }
-    }
-}
-
 // SAFETY: It is safe to send a `CoherentAllocation` to another thread if `T`
 // can be sent to another thread.
-unsafe impl<T: AsBytes + FromBytes + Send> Send for CoherentAllocation<T> {}
+unsafe impl<T: AsBytes + FromBytes + Send, A: Allocator> Send for CoherentAllocation<T, A> {}
+
+// TODO
+unsafe impl<T: AsBytes + FromBytes + Sync, A: Allocator> Sync for CoherentAllocation<T, A> {}
 
 /// Reads a field of an item from an allocated region of structs.
 ///
@@ -320,7 +311,7 @@ unsafe impl<T: AsBytes + FromBytes + Send> Send for CoherentAllocation<T> {}
 /// // SAFETY: Instances of `MyStruct` have no uninitialized portions.
 /// unsafe impl kernel::transmute::AsBytes for MyStruct{};
 ///
-/// # fn test(alloc: &kernel::dma::CoherentAllocation<MyStruct>) -> Result {
+/// # fn test(alloc: &kernel::dma::CoherentAllocation<MyStruct, kernel::dma::CoherentAllocator>) -> Result {
 /// let whole = kernel::dma_read!(alloc[2]);
 /// let field = kernel::dma_read!(alloc[1].field);
 /// # Ok::<(), Error>(()) }
@@ -360,7 +351,7 @@ macro_rules! dma_read {
 /// // SAFETY: Instances of `MyStruct` have no uninitialized portions.
 /// unsafe impl kernel::transmute::AsBytes for MyStruct{};
 ///
-/// # fn test(alloc: &kernel::dma::CoherentAllocation<MyStruct>) -> Result {
+/// # fn test(alloc: &kernel::dma::CoherentAllocation<MyStruct, kernel::dma::CoherentAllocator>) -> Result {
 /// kernel::dma_write!(alloc[2].member = 0xf);
 /// kernel::dma_write!(alloc[1] = MyStruct { member: 0xf });
 /// # Ok::<(), Error>(()) }
@@ -388,4 +379,209 @@ macro_rules! dma_write {
             $crate::dma::CoherentAllocation::field_write(&$dma, ptr_field, $val)
         }
     };
+}
+
+pub struct CoherentAllocator;
+
+impl CoherentAllocator {
+    /// Allocates a region of `size_of::<T> * count` of consistent memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kernel::device::Device;
+    /// use kernel::dma::{attrs::*, CoherentAllocation, CoherentAllocator};
+    ///
+    /// # fn test(dev: &Device) -> Result {
+    /// let c: CoherentAllocation<u64, _> = CoherentAllocator::alloc_attrs(dev.into(), 4, GFP_KERNEL,
+    ///                                                                  DMA_ATTR_NO_WARN)?;
+    /// # Ok::<(), Error>(()) }
+    /// ```
+    pub fn alloc_attrs<T: FromBytes + AsBytes>(
+        dev: ARef<Device>,
+        count: usize,
+        gfp_flags: kernel::alloc::Flags,
+        dma_attrs: Attrs,
+    ) -> Result<CoherentAllocation<T, Self>> {
+        build_assert!(
+            core::mem::size_of::<T>() > 0,
+            "It doesn't make sense for the allocated type to be a ZST"
+        );
+
+        let size = count
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(EOVERFLOW)?;
+        let mut dma_handle = 0;
+        // SAFETY: device pointer is guaranteed as valid by invariant on `Device`.
+        // We ensure that we catch the failure on this function and throw an ENOMEM
+        let ret = unsafe {
+            bindings::dma_alloc_attrs(
+                dev.as_raw(),
+                size,
+                &mut dma_handle,
+                gfp_flags.as_raw(),
+                dma_attrs.as_raw(),
+            )
+        };
+        if ret.is_null() {
+            return Err(ENOMEM);
+        }
+        // INVARIANT: We just successfully allocated a coherent region which is accessible for
+        // `count` elements, hence the cpu address is valid. We also hold a refcounted reference
+        // to the device.
+        Ok(CoherentAllocation::new(
+            ret as *mut T,
+            dma_handle,
+            count,
+            dev,
+            dma_attrs,
+        ))
+    }
+
+    /// Performs the same functionality as `alloc_attrs`, except the `dma_attrs` is 0 by default.
+    pub fn alloc_coherent<T: FromBytes + AsBytes>(
+        dev: ARef<Device>,
+        count: usize,
+        gfp_flags: kernel::alloc::Flags,
+    ) -> Result<CoherentAllocation<T, Self>> {
+        Self::alloc_attrs(dev, count, gfp_flags, Attrs(0))
+    }
+}
+
+impl Allocator for CoherentAllocator {
+    type AllocationData = ARef<Device>;
+    type DataSource = ARef<Device>;
+
+    fn free(
+        cpu_addr: *mut crate::ffi::c_void,
+        dma_handle: u64,
+        size: usize,
+        alloc_data: &Self::AllocationData,
+        attrs: Attrs,
+    ) {
+        // SAFETY: the device, cpu address, and the dma handle is valid due to the
+        // type invariants on `CoherentAllocation`.
+        unsafe {
+            bindings::dma_free_attrs(
+                alloc_data.as_raw(),
+                size,
+                cpu_addr as _,
+                dma_handle,
+                attrs.as_raw(),
+            )
+        }
+    }
+
+    unsafe fn allocation_data(data: &ARef<Device>) -> ARef<Device> {
+        data.clone()
+    }
+}
+
+impl<T: AsBytes + FromBytes, A: Allocator> Drop for CoherentAllocation<T, A> {
+    fn drop(&mut self) {
+        let size = self.count * core::mem::size_of::<T>();
+        A::free(
+            self.cpu_addr as _,
+            self.dma_handle,
+            size,
+            &self.dev,
+            self.dma_attrs,
+        );
+    }
+}
+
+pub struct Pool<T> {
+    ptr: *mut bindings::dma_pool,
+    dev: ARef<Device>,
+    count: usize,
+    _p: PhantomData<T>,
+}
+
+impl<T: AsBytes + FromBytes> Pool<T> {
+    /// Creates a new DMA memory pool.
+    pub fn try_new(
+        name: &CStr,
+        dev: ARef<Device>,
+        count: usize,
+        align: usize,
+        boundary: usize,
+    ) -> Result<Arc<Self>> {
+        let t_size = core::mem::size_of::<T>();
+        let size = count.checked_mul(t_size).ok_or(ENOMEM)?;
+        let ptr = unsafe {
+            bindings::dma_pool_create(name.as_char_ptr(), dev.as_raw(), size, align, boundary)
+        };
+        if ptr.is_null() {
+            Err(ENOMEM)
+        } else {
+            Arc::new(
+                Self {
+                    ptr,
+                    count,
+                    dev,
+                    _p: PhantomData,
+                },
+                flags::GFP_KERNEL,
+            )
+            .map_err(|e| e.into())
+        }
+    }
+
+    /// Allocates some memory from the pool.
+    pub fn try_alloc(&self, atomic: bool) -> Result<CoherentAllocation<T, Self>> {
+        let flags = if atomic {
+            bindings::GFP_ATOMIC
+        } else {
+            bindings::GFP_KERNEL
+        };
+
+        let mut dma_handle = 0;
+        let ptr = unsafe { bindings::dma_pool_alloc(self.ptr, flags, &mut dma_handle) };
+        if ptr.is_null() {
+            Err(ENOMEM)
+        } else {
+            Ok(CoherentAllocation::new(
+                ptr as _,
+                dma_handle,
+                self.count,
+                self.ptr,
+                Attrs(0),
+            ))
+        }
+    }
+}
+
+// SAFETY: A `Pool` is a reference (pointer) to an underlying C `struct
+// dma_pool`. Operations on the underlying pool is protected by a spinlock.
+unsafe impl<T> Send for Pool<T> {}
+
+// SAFETY: A `Pool` is a reference (pointer) to an underlying C `struct
+// dma_pool`. Operations on the underlying pool is protected by a spinlock.
+unsafe impl<T> Sync for Pool<T> {}
+
+impl<T> Drop for Pool<T> {
+    fn drop(&mut self) {
+        // SAFETY: `Pool` is always reference-counted and each allocation increments it, so all
+        // allocations have been freed by the time this gets called.
+        unsafe { bindings::dma_pool_destroy(self.ptr) };
+    }
+}
+
+impl<T> Allocator for Pool<T> {
+    type AllocationData = *mut bindings::dma_pool;
+    type DataSource = Arc<Self>;
+
+    fn free(
+        cpu_addr: *mut crate::ffi::c_void,
+        dma_handle: u64,
+        _size: usize,
+        pool: &*mut bindings::dma_pool,
+        _: Attrs,
+    ) {
+        unsafe { bindings::dma_pool_free(*pool, cpu_addr as _, dma_handle) };
+    }
+
+    unsafe fn allocation_data(data: &Arc<Self>) -> *mut bindings::dma_pool {
+        data.ptr
+    }
 }
