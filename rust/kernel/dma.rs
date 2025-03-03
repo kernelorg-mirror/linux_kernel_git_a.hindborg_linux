@@ -250,10 +250,10 @@ impl<T: AsBytes + FromBytes, A: Allocator> CoherentAllocation<T, A> {
     /// # fn test(alloc: &mut kernel::dma::CoherentAllocation<u8, kernel::dma::CoherentAllocator>) -> Result {
     /// let somedata: [u8; 4] = [0xf; 4];
     /// let buf: &[u8] = &somedata;
-    /// alloc.write(buf, 0)?;
+    /// alloc.write_slice(buf, 0)?;
     /// # Ok::<(), Error>(()) }
     /// ```
-    pub fn write(&self, src: &[T], offset: usize) -> Result {
+    pub fn write_slice(&self, src: &[T], offset: usize) -> Result {
         let end = offset.checked_add(src.len()).ok_or(EOVERFLOW)?;
         if end >= self.count {
             return Err(EINVAL);
@@ -267,6 +267,53 @@ impl<T: AsBytes + FromBytes, A: Allocator> CoherentAllocation<T, A> {
             core::ptr::copy_nonoverlapping(src.as_ptr(), self.cpu_addr.add(offset), src.len())
         };
         Ok(())
+    }
+
+    pub fn read(&self, index: usize) -> Option<T> {
+        if index >= self.count {
+            return None;
+        }
+
+        let ptr = self.cpu_addr.wrapping_add(index);
+        // SAFETY: We just checked that the index is within bounds.
+        Some(unsafe { ptr.read() })
+    }
+
+    pub fn read_volatile(&self, index: usize) -> Option<T> {
+        if index >= self.count {
+            return None;
+        }
+
+        let ptr = self.cpu_addr.wrapping_add(index);
+        // SAFETY: We just checked that the index is within bounds.
+        Some(unsafe { ptr.read_volatile() })
+    }
+
+    pub fn write_item(&self, index: usize, value: &T) -> bool
+    where
+        T: Copy,
+    {
+        if index >= self.count {
+            return false;
+        }
+
+        let ptr = self.cpu_addr.wrapping_add(index);
+        // SAFETY: We just checked that the index is within bounds.
+        unsafe { ptr.write(*value) };
+        true
+    }
+
+    pub fn read_write(&self, index: usize, value: T) -> Option<T> {
+        if index >= self.count {
+            return None;
+        }
+
+        let ptr = self.cpu_addr.wrapping_add(index);
+        // SAFETY: We just checked that the index is within bounds.
+        let ret = unsafe { ptr.read() };
+        // SAFETY: We just checked that the index is within bounds.
+        unsafe { ptr.write(value) };
+        Some(ret)
     }
 
     pub unsafe fn from_parts(
