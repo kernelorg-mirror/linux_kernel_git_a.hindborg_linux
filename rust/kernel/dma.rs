@@ -207,6 +207,128 @@ impl<T: AsBytes + FromBytes, A: Allocator> CoherentAllocation<T, A> {
         self.dma_handle
     }
 
+    /// Returns the data from the region starting from `offset` as a slice.
+    /// `offset` and `count` are in units of `T`, not the number of bytes.
+    ///
+    /// Due to the safety requirements of slice, the caller should consider that the region could
+    /// be modified by the device at anytime (see the safety block below). For ringbuffer type of
+    /// r/w access or use-cases where the pointer to the live data is needed, `start_ptr()` or
+    /// `start_ptr_mut()` could be used instead.
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure that no hardware operations that involve the buffer are currently
+    /// taking place while the returned slice is live.
+    pub unsafe fn as_slice(&self, offset: usize, count: usize) -> Result<&[T]> {
+        let end = offset.checked_add(count).ok_or(EOVERFLOW)?;
+        if end >= self.count {
+            return Err(EINVAL);
+        }
+        // SAFETY:
+        // - The pointer is valid due to type invariant on `CoherentAllocation`,
+        // we've just checked that the range and index is within bounds. The immutability of the
+        // of data is also guaranteed by the safety requirements of the function.
+        // - `offset` can't overflow since it is smaller than `self.count` and we've checked
+        // that `self.count` won't overflow early in the constructor.
+        Ok(unsafe { core::slice::from_raw_parts(self.cpu_addr.add(offset), count) })
+    }
+
+    /// Performs the same functionality as `as_slice`, except that a mutable slice is returned.
+    /// See that method for documentation and safety requirements.
+    ///
+    /// # Safety
+    ///
+    /// It is the callers responsibility to avoid separate read and write accesses to the region
+    /// while the returned slice is live.
+    pub unsafe fn as_slice_mut(&self, offset: usize, count: usize) -> Result<&mut [T]> {
+        let end = offset.checked_add(count).ok_or(EOVERFLOW)?;
+        if end >= self.count {
+            return Err(EINVAL);
+        }
+        // SAFETY:
+        // - The pointer is valid due to type invariant on `CoherentAllocation`,
+        // we've just checked that the range and index is within bounds. The immutability of the
+        // of data is also guaranteed by the safety requirements of the function.
+        // - `offset` can't overflow since it is smaller than `self.count` and we've checked
+        // that `self.count` won't overflow early in the constructor.
+        Ok(unsafe { core::slice::from_raw_parts_mut(self.cpu_addr.add(offset), count) })
+    }
+
+    /// Writes data to the region starting from `offset`. `offset` is in units of `T`, not the
+    /// number of bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn test(alloc: &mut kernel::dma::CoherentAllocation<u8, kernel::dma::CoherentAllocator>) -> Result {
+    /// let somedata: [u8; 4] = [0xf; 4];
+    /// let buf: &[u8] = &somedata;
+    /// alloc.write_slice(buf, 0)?;
+    /// # Ok::<(), Error>(()) }
+    /// ```
+    pub fn write_slice(&self, src: &[T], offset: usize) -> Result {
+        let end = offset.checked_add(src.len()).ok_or(EOVERFLOW)?;
+        if end >= self.count {
+            return Err(EINVAL);
+        }
+        // SAFETY:
+        // - The pointer is valid due to type invariant on `CoherentAllocation`
+        // and we've just checked that the range and index is within bounds.
+        // - `offset` can't overflow since it is smaller than `self.count` and we've checked
+        // that `self.count` won't overflow early in the constructor.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), self.cpu_addr.add(offset), src.len())
+        };
+        Ok(())
+    }
+
+    pub fn read(&self, index: usize) -> Option<T> {
+        if index >= self.count {
+            return None;
+        }
+
+        let ptr = self.cpu_addr.wrapping_add(index);
+        // SAFETY: We just checked that the index is within bounds.
+        Some(unsafe { ptr.read() })
+    }
+
+    pub fn read_volatile(&self, index: usize) -> Option<T> {
+        if index >= self.count {
+            return None;
+        }
+
+        let ptr = self.cpu_addr.wrapping_add(index);
+        // SAFETY: We just checked that the index is within bounds.
+        Some(unsafe { ptr.read_volatile() })
+    }
+
+    pub fn write_item(&self, index: usize, value: &T) -> bool
+    where
+        T: Copy,
+    {
+        if index >= self.count {
+            return false;
+        }
+
+        let ptr = self.cpu_addr.wrapping_add(index);
+        // SAFETY: We just checked that the index is within bounds.
+        unsafe { ptr.write(*value) };
+        true
+    }
+
+    pub fn read_write(&self, index: usize, value: T) -> Option<T> {
+        if index >= self.count {
+            return None;
+        }
+
+        let ptr = self.cpu_addr.wrapping_add(index);
+        // SAFETY: We just checked that the index is within bounds.
+        let ret = unsafe { ptr.read() };
+        // SAFETY: We just checked that the index is within bounds.
+        unsafe { ptr.write(value) };
+        Some(ret)
+    }
+
     pub unsafe fn from_parts(
         data: &A::DataSource,
         ptr: usize,
