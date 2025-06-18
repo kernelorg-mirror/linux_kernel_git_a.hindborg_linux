@@ -10,7 +10,7 @@ use crate::{
     error::from_err_ptr,
     error::Result,
     prelude::*,
-    types::{ARef, AlwaysRefCounted, Opaque},
+    types::{ARef, AlwaysRefCounted, Opaque, RefCounted},
 };
 use core::{mem, ops::Deref, ptr, ptr::NonNull};
 
@@ -184,7 +184,7 @@ impl<T: drm::Driver> Deref for Device<T> {
 
 // SAFETY: DRM device objects are always reference counted and the get/put functions
 // satisfy the requirements.
-unsafe impl<T: drm::Driver> AlwaysRefCounted for Device<T> {
+unsafe impl<T: drm::Driver> RefCounted for Device<T> {
     fn inc_ref(&self) {
         // SAFETY: The existence of a shared reference guarantees that the refcount is non-zero.
         unsafe { bindings::drm_dev_get(self.as_raw()) };
@@ -195,6 +195,8 @@ unsafe impl<T: drm::Driver> AlwaysRefCounted for Device<T> {
         unsafe { bindings::drm_dev_put(obj.cast().as_ptr()) };
     }
 }
+
+unsafe impl<T: drm::Driver> AlwaysRefCounted for Device<T> {}
 
 impl<T: drm::Driver> AsRef<device::Device> for Device<T> {
     fn as_ref(&self) -> &device::Device {

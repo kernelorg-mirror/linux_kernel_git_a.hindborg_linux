@@ -10,7 +10,7 @@ use crate::{
     drm::driver::{AllocImpl, AllocOps},
     error::{to_result, Result},
     prelude::*,
-    types::{ARef, AlwaysRefCounted, Opaque},
+    types::{ARef, AlwaysRefCounted, Opaque, RefCounted},
 };
 use core::{mem, ops::Deref, ptr::NonNull};
 
@@ -55,7 +55,7 @@ pub trait IntoGEMObject: Sized + super::private::Sealed + AlwaysRefCounted {
 }
 
 // SAFETY: All gem objects are refcounted.
-unsafe impl<T: IntoGEMObject> AlwaysRefCounted for T {
+unsafe impl<T: IntoGEMObject> RefCounted for T {
     fn inc_ref(&self) {
         // SAFETY: The existence of a shared reference guarantees that the refcount is non-zero.
         unsafe { bindings::drm_gem_object_get(self.as_raw()) };
@@ -73,6 +73,8 @@ unsafe impl<T: IntoGEMObject> AlwaysRefCounted for T {
         unsafe { bindings::drm_gem_object_put(obj) };
     }
 }
+
+unsafe impl<T: IntoGEMObject> AlwaysRefCounted for T {}
 
 /// Trait which must be implemented by drivers using base GEM objects.
 pub trait DriverObject: BaseDriverObject<Object<Self>> {
