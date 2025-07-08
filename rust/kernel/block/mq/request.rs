@@ -306,7 +306,7 @@ unsafe impl<T: Operations> Ownable for Request<T> {
 
         debug_assert!(
             old == 0,
-            "Request reached refcount zero in Rust abstractions"
+            "Invalid refcount when releasing `Owned<Request<T>>`"
         );
     }
 }
