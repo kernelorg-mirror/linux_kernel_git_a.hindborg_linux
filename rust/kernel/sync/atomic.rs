@@ -29,8 +29,26 @@ unsafe impl generic::AllowAtomic for i32 {
     type Repr = i32;
 }
 
+// SAFETY: `i32` is always sound to transmute back to itself.
+unsafe impl generic::AllowAtomicArithmetic for i32 {
+    type Delta = i32;
+
+    fn delta_into_repr(d: Self::Delta) -> Self::Repr {
+        d
+    }
+}
+
 // SAFETY: `i64` has the same size and alignment with itself, and is round-trip transmutable to
 // itself.
 unsafe impl generic::AllowAtomic for i64 {
     type Repr = i64;
+}
+
+// SAFETY: `i64` is always sound to transmute back to itself.
+unsafe impl generic::AllowAtomicArithmetic for i64 {
+    type Delta = i64;
+
+    fn delta_into_repr(d: Self::Delta) -> Self::Repr {
+        d
+    }
 }
