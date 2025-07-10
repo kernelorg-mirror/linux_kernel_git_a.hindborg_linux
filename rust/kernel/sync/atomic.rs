@@ -17,3 +17,6 @@
 //! [`LKMM`]: srctree/tools/memory-model/
 
 pub mod ops;
+pub mod ordering;
+
+pub use ordering::{Acquire, Full, Relaxed, Release};
