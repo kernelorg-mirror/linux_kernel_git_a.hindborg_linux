@@ -53,6 +53,26 @@ unsafe impl generic::AllowAtomicArithmetic for i64 {
     }
 }
 
+// SAFETY: For 32bit kernel, `isize` has the same size and alignment with `i32` and is round-trip
+// transmutable to it, for 64bit kernel `isize` has the same size and alignment with `i64` and is
+// round-trip transmutable to it.
+unsafe impl generic::AllowAtomic for isize {
+    #[cfg(not(CONFIG_64BIT))]
+    type Repr = i32;
+    #[cfg(CONFIG_64BIT)]
+    type Repr = i64;
+}
+
+// SAFETY: `isize` is always sound to transmute back from `i32` or `i64` when their sizes are the
+// same.
+unsafe impl generic::AllowAtomicArithmetic for isize {
+    type Delta = Self;
+
+    fn delta_into_repr(d: Self::Delta) -> Self::Repr {
+        d as Self::Repr
+    }
+}
+
 // SAFETY: `u32` and `i32` has the same size and alignment, and `u32` is round-trip transmutable to
 // `i32`.
 unsafe impl generic::AllowAtomic for u32 {
@@ -83,6 +103,26 @@ unsafe impl generic::AllowAtomicArithmetic for u64 {
     }
 }
 
+// SAFETY: For 32bit kernel, `usize` has the same size and alignment with `i32` and is round-trip
+// transmutable to it, for 64bit kernel `usize` has the same size and alignment with `i64` and is
+// round-trip transmutable to it.
+unsafe impl generic::AllowAtomic for usize {
+    #[cfg(not(CONFIG_64BIT))]
+    type Repr = i32;
+    #[cfg(CONFIG_64BIT)]
+    type Repr = i64;
+}
+
+// SAFETY: `usize` is always sound to transmute back from `i32` or `i64` when their sizes are the
+// same.
+unsafe impl generic::AllowAtomicArithmetic for usize {
+    type Delta = Self;
+
+    fn delta_into_repr(d: Self::Delta) -> Self::Repr {
+        d as Self::Repr
+    }
+}
+
 use crate::macros::kunit_tests;
 
 #[kunit_tests(rust_atomics)]
@@ -102,7 +142,7 @@ mod tests {
 
     #[test]
     fn atomic_basic_tests() {
-        for_each_type!(42 in [i32, i64, u32, u64] |v| {
+        for_each_type!(42 in [i32, i64, u32, u64, isize, usize] |v| {
             let x = Atomic::new(v);
 
             assert_eq!(v, x.load(Relaxed));
@@ -111,7 +151,7 @@ mod tests {
 
     #[test]
     fn atomic_xchg_tests() {
-        for_each_type!(42 in [i32, i64, u32, u64] |v| {
+        for_each_type!(42 in [i32, i64, u32, u64, isize, usize] |v| {
             let x = Atomic::new(v);
 
             let old = v;
@@ -124,7 +164,7 @@ mod tests {
 
     #[test]
     fn atomic_cmpxchg_tests() {
-        for_each_type!(42 in [i32, i64, u32, u64] |v| {
+        for_each_type!(42 in [i32, i64, u32, u64, isize, usize] |v| {
             let x = Atomic::new(v);
 
             let old = v;
@@ -139,7 +179,7 @@ mod tests {
 
     #[test]
     fn atomic_arithmetic_tests() {
-        for_each_type!(42 in [i32, i64, u32, u64] |v| {
+        for_each_type!(42 in [i32, i64, u32, u64, isize, usize] |v| {
             let x = Atomic::new(v);
 
             assert_eq!(v, x.fetch_add(12, Full));
