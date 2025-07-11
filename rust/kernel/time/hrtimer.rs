@@ -86,6 +86,12 @@ impl Ktime {
     pub fn to_ns(self) -> i64 {
         self.inner
     }
+
+    /// Creates a new Ktime from the given duration in nanoseconds.
+    #[inline]
+    pub fn from_nanos(ns: impl Into<bindings::ktime_t>) -> Self {
+        Self { inner: ns.into() }
+    }
 }
 
 /// A timer backed by a C `struct hrtimer`.
