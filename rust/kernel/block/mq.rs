@@ -107,5 +107,8 @@ mod request;
 mod tag_set;
 
 pub use operations::Operations;
-pub use request::Request;
+pub use request::{
+    Request,
+    RequestTimerHandle, //
+};
 pub use tag_set::TagSet;
