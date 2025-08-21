@@ -19,15 +19,20 @@ use kernel::{
             Operations,
             TagSet, //
         },
+        PAGE_SECTOR_MASK, SECTOR_SHIFT,
     },
     error::{
         code,
         Result, //
     },
+    ffi,
     memalloc_scope,
     new_mutex,
     new_xarray,
-    page::SafePage,
+    page::{
+        SafePage, //
+        PAGE_SIZE,
+    },
     pr_info,
     prelude::*,
     str::CString,
@@ -100,6 +105,11 @@ module! {
             default: -1,
             description: "Home node for the device. Default: -1 (no node)",
         },
+        discard: bool {
+            default: false,
+            description:
+                "Support discard operations (requires memory-backed null_blk device).",
+        },
     },
 }
 
@@ -137,6 +147,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                     memory_backed: module_parameters::memory_backed.value(),
                     submit_queues,
                     home_node: module_parameters::home_node.value(),
+                    discard: module_parameters::discard.value(),
                 })?;
                 disks.push(disk, GFP_KERNEL)?;
             }
@@ -161,6 +172,7 @@ struct NullBlkOptions<'a> {
     memory_backed: bool,
     submit_queues: u32,
     home_node: i32,
+    discard: bool,
 }
 struct NullBlkDevice;
 
@@ -176,6 +188,7 @@ impl NullBlkDevice {
             memory_backed,
             submit_queues,
             home_node,
+            discard,
         } = options;
 
         let flags = if memory_backed {
@@ -205,22 +218,30 @@ impl NullBlkDevice {
                 irq_mode,
                 completion_time,
                 memory_backed,
+                block_size: block_size as usize,
             }),
             GFP_KERNEL,
         )?;
 
-        gen_disk::GenDiskBuilder::new()
+        let mut builder = gen_disk::GenDiskBuilder::new()
             .capacity_sectors(capacity_mib << (20 - block::SECTOR_SHIFT))
             .logical_block_size(block_size)?
             .physical_block_size(block_size)?
-            .rotational(rotational)
-            .build(fmt!("{}", name.to_str()?), tagset, queue_data)
+            .rotational(rotational);
+
+        if memory_backed && discard {
+            builder = builder
+                // Max IO size is u32::MAX bytes
+                .max_hw_discard_sectors(ffi::c_uint::MAX >> block::SECTOR_SHIFT);
+        }
+
+        builder.build(fmt!("{}", name.to_str()?), tagset, queue_data)
     }
 
     #[inline(always)]
     fn write(tree: &XArray<TreeNode>, mut sector: usize, mut segment: Segment<'_>) -> Result {
         while !segment.is_empty() {
-            let page = SafePage::alloc_page(GFP_KERNEL)?;
+            let page = NullBlockPage::new()?;
             let mut tree = tree.lock();
 
             let page_idx = sector >> block::PAGE_SECTORS_SHIFT;
@@ -232,8 +253,10 @@ impl NullBlkDevice {
                 tree.get_mut(page_idx).unwrap()
             };
 
+            page.set_occupied(sector);
             let page_offset = (sector & block::PAGE_SECTOR_MASK as usize) << block::SECTOR_SHIFT;
-            sector += segment.copy_to_page(page, page_offset) >> block::SECTOR_SHIFT;
+            sector +=
+                segment.copy_to_page(page.page.as_pin_mut(), page_offset) >> block::SECTOR_SHIFT;
         }
         Ok(())
     }
@@ -248,10 +271,41 @@ impl NullBlkDevice {
             if let Some(page) = tree.get(idx) {
                 let page_offset =
                     (sector & block::PAGE_SECTOR_MASK as usize) << block::SECTOR_SHIFT;
-                sector += segment.copy_from_page(page, page_offset) >> block::SECTOR_SHIFT;
+                sector += segment.copy_from_page(&page.page, page_offset) >> block::SECTOR_SHIFT;
             } else {
                 sector += segment.zero_page() >> block::SECTOR_SHIFT;
             }
+        }
+
+        Ok(())
+    }
+
+    fn discard(
+        tree: &XArray<TreeNode>,
+        mut sector: usize,
+        sectors: usize,
+        block_size: usize,
+    ) -> Result {
+        let mut remaining_bytes = sectors << SECTOR_SHIFT;
+        let mut tree = tree.lock();
+
+        while remaining_bytes > 0 {
+            let page_idx = sector >> block::PAGE_SECTORS_SHIFT;
+            let mut remove = false;
+            if let Some(page) = tree.get_mut(page_idx) {
+                page.set_free(sector);
+                if page.is_empty() {
+                    remove = true;
+                }
+            }
+
+            if remove {
+                drop(tree.remove(page_idx))
+            }
+
+            let processed = remaining_bytes.min(block_size);
+            sector += processed >> SECTOR_SHIFT;
+            remaining_bytes -= processed;
         }
 
         Ok(())
@@ -273,7 +327,40 @@ impl NullBlkDevice {
     }
 }
 
-type TreeNode = Owned<SafePage>;
+static_assert!((PAGE_SIZE >> SECTOR_SHIFT) <= 64);
+
+struct NullBlockPage {
+    page: Owned<SafePage>,
+    status: u64,
+}
+
+impl NullBlockPage {
+    fn new() -> Result<KBox<Self>> {
+        Ok(KBox::new(
+            Self {
+                page: SafePage::alloc_page(GFP_KERNEL | __GFP_ZERO)?,
+                status: 0,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+
+    fn set_occupied(&mut self, sector: usize) {
+        let idx = sector & PAGE_SECTOR_MASK as usize;
+        self.status |= 1 << idx;
+    }
+
+    fn set_free(&mut self, sector: usize) {
+        let idx = sector & PAGE_SECTOR_MASK as usize;
+        self.status &= !(1 << idx);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.status == 0
+    }
+}
+
+type TreeNode = KBox<NullBlockPage>;
 
 #[pin_data]
 struct QueueData {
@@ -282,6 +369,7 @@ struct QueueData {
     irq_mode: IRQMode,
     completion_time: Delta,
     memory_backed: bool,
+    block_size: usize,
 }
 
 #[pin_data]
@@ -332,12 +420,16 @@ impl Operations for NullBlkDevice {
             let command = rq.command();
             let mut sector = rq.sector();
 
-            for bio in rq.bio_iter_mut() {
-                let segment_iter = bio.segment_iter();
-                for segment in segment_iter {
-                    let length = segment.len();
-                    Self::transfer(command, tree, sector, segment)?;
-                    sector += length as usize >> block::SECTOR_SHIFT;
+            if command == bindings::req_op_REQ_OP_DISCARD {
+                Self::discard(tree, sector, rq.sectors(), queue_data.block_size)?;
+            } else {
+                for bio in rq.bio_iter_mut() {
+                    let segment_iter = bio.segment_iter();
+                    for segment in segment_iter {
+                        let length = segment.len();
+                        Self::transfer(command, tree, sector, segment)?;
+                        sector += length as usize >> block::SECTOR_SHIFT;
+                    }
                 }
             }
         }
