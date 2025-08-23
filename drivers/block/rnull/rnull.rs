@@ -9,6 +9,7 @@ use kernel::{
     bindings,
     block::{
         self,
+        badblocks::{self, BadBlocks},
         bio::Segment,
         mq::{
             self,
@@ -38,6 +39,10 @@ use kernel::{
     str::CString,
     sync::{
         aref::ARef,
+        atomic::{
+            ordering,
+            Atomic, //
+        },
         Arc,
         Mutex, //
     },
@@ -153,6 +158,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                     home_node: module_parameters::home_node.value(),
                     discard: module_parameters::discard.value(),
                     no_sched: module_parameters::no_sched.value(),
+                    bad_blocks: Arc::pin_init(BadBlocks::new(false), GFP_KERNEL)?,
                 })?;
                 disks.push(disk, GFP_KERNEL)?;
             }
@@ -179,6 +185,7 @@ struct NullBlkOptions<'a> {
     home_node: i32,
     discard: bool,
     no_sched: bool,
+    bad_blocks: Arc<BadBlocks>,
 }
 struct NullBlkDevice;
 
@@ -196,6 +203,7 @@ impl NullBlkDevice {
             home_node,
             discard,
             no_sched,
+            bad_blocks,
         } = options;
 
         let mut flags = mq::tag_set::Flags::default();
@@ -237,6 +245,7 @@ impl NullBlkDevice {
                 completion_time,
                 memory_backed,
                 block_size: block_size.into(),
+                bad_blocks,
             }),
             GFP_KERNEL,
         )?;
@@ -351,6 +360,16 @@ impl NullBlkDevice {
         }
         Ok(())
     }
+
+    fn end_request(rq: Owned<mq::Request<Self>>) {
+        let status = rq.data_ref().error.load(ordering::Relaxed);
+        rq.data_ref().error.store(0, ordering::Relaxed);
+
+        match status {
+            0 => rq.end_ok(),
+            _ => rq.end(bindings::BLK_STS_IOERR),
+        }
+    }
 }
 
 static_assert!((PAGE_SIZE >> SECTOR_SHIFT) <= 64);
@@ -396,12 +415,14 @@ struct QueueData {
     completion_time: Delta,
     memory_backed: bool,
     block_size: u64,
+    bad_blocks: Arc<BadBlocks>,
 }
 
 #[pin_data]
 struct Pdu {
     #[pin]
     timer: kernel::time::hrtimer::HrTimer<Self>,
+    error: Atomic<u32>,
 }
 
 impl HrTimerCallback for Pdu {
@@ -431,6 +452,7 @@ impl Operations for NullBlkDevice {
     fn new_request_data() -> impl PinInit<Self::RequestData> {
         pin_init!(Pdu {
             timer <- kernel::time::hrtimer::HrTimer::new(),
+            error: Atomic::new(0),
         })
     }
 
@@ -440,6 +462,19 @@ impl Operations for NullBlkDevice {
         mut rq: Owned<mq::Request<Self>>,
         _is_last: bool,
     ) -> Result {
+        if queue_data.bad_blocks.enabled() {
+            let start = rq.sector();
+            let end = start + u64::from(rq.sectors());
+            if !matches!(
+                queue_data.bad_blocks.check(start..end),
+                badblocks::BlockStatus::None
+            ) {
+                rq.data_ref().error.store(1, ordering::Relaxed);
+            }
+        }
+
+        // TODO: Skip IO if bad block.
+
         if queue_data.memory_backed {
             memalloc_scope!(let _noio: NoIo);
             let tree = &queue_data.tree;
@@ -461,7 +496,7 @@ impl Operations for NullBlkDevice {
         }
 
         match queue_data.irq_mode {
-            IRQMode::None => rq.end_ok(),
+            IRQMode::None => Self::end_request(rq),
             IRQMode::Soft => mq::Request::complete(rq.into()),
             IRQMode::Timer => {
                 OwnableRefCounted::into_shared(rq)
@@ -475,9 +510,10 @@ impl Operations for NullBlkDevice {
     fn commit_rqs(_queue_data: Pin<&QueueData>) {}
 
     fn complete(rq: ARef<mq::Request<Self>>) {
-        OwnableRefCounted::try_from_shared(rq)
-            .map_err(|_e| kernel::error::code::EIO)
-            .expect("Failed to complete request")
-            .end_ok();
+        Self::end_request(
+            OwnableRefCounted::try_from_shared(rq)
+                .map_err(|_e| kernel::error::code::EIO)
+                .expect("Failed to complete request"),
+        )
     }
 }
