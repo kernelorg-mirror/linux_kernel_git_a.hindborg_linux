@@ -139,6 +139,10 @@ module! {
             default: 0,
             description: "Max bandwidth in MiB/s. 0 means no limit.",
         },
+        blocking: bool {
+            default: false,
+            description: "Register as a blocking blk-mq driver device",
+        },
     },
 }
 
@@ -185,6 +189,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                     bad_blocks_partial_io: false,
                     storage: Arc::pin_init(DiskStorage::new(0, block_size as usize), GFP_KERNEL)?,
                     bandwidth_limit: u64::from(module_parameters::mbps.value()) * 2u64.pow(20),
+                    blocking: module_parameters::blocking.value(),
                 })?;
                 disks.push(disk, GFP_KERNEL)?;
             }
@@ -216,6 +221,7 @@ struct NullBlkOptions<'a> {
     bad_blocks_partial_io: bool,
     storage: Arc<DiskStorage>,
     bandwidth_limit: u64,
+    blocking: bool,
 }
 
 #[pin_data]
@@ -258,11 +264,12 @@ impl NullBlkDevice {
             bad_blocks_partial_io,
             storage,
             bandwidth_limit,
+            blocking,
         } = options;
 
         let mut flags = mq::tag_set::Flags::default();
 
-        if memory_backed {
+        if blocking || memory_backed {
             flags |= mq::tag_set::Flag::Blocking;
         }
 
