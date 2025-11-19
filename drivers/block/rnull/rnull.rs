@@ -147,6 +147,10 @@ module! {
             default: false,
             description: "Share tag set between devices for blk-mq",
         },
+        hw_queue_depth: u32 {
+            default: 64,
+            description:  "Queue depth for each hardware queue. Default: 64",
+        },
     },
 }
 
@@ -172,6 +176,7 @@ impl kernel::InPlaceModule for NullBlkModule {
             let blocking = module_parameters::blocking.value();
             let memory_backed = module_parameters::memory_backed.value();
             let no_sched = module_parameters::no_sched.value();
+            let hw_queue_depth = module_parameters::hw_queue_depth.value();
 
             let shared_tag_set = NullBlkDevice::build_tag_set(TagSetOptions {
                 submit_queues,
@@ -179,6 +184,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                 blocking,
                 memory_backed,
                 no_sched,
+                hw_queue_depth,
             })?;
 
             let mut disks = KVec::new();
@@ -209,6 +215,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                         blocking,
                         memory_backed,
                         no_sched,
+                        hw_queue_depth,
                     },
                 })?;
                 disks.push(disk, GFP_KERNEL)?;
@@ -264,6 +271,7 @@ struct TagSetOptions {
     blocking: bool,
     memory_backed: bool,
     no_sched: bool,
+    hw_queue_depth: u32,
 }
 
 impl NullBlkDevice {
@@ -276,6 +284,7 @@ impl NullBlkDevice {
             blocking,
             memory_backed,
             no_sched,
+            hw_queue_depth,
         } = options;
 
         if home_node > kernel::numa::num_online_nodes().try_into()? {
@@ -297,7 +306,7 @@ impl NullBlkDevice {
         }
 
         Arc::pin_init(
-            TagSet::new(submit_queues, (), 256, 1, numa_node, flags),
+            TagSet::new(submit_queues, (), hw_queue_depth, 1, numa_node, flags),
             GFP_KERNEL,
         )
     }

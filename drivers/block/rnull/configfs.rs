@@ -118,6 +118,7 @@ impl configfs::GroupOperations for Config {
                 mbps: 16,
                 blocking: 17,
                 shared_tags: 18,
+                hw_queue_depth: 19
             ],
         };
 
@@ -153,6 +154,7 @@ impl configfs::GroupOperations for Config {
                     blocking: false,
                     shared_tags: false,
                     shared_tag_set: self.shared_tag_set.clone(),
+                    hw_queue_depth: 64,
                 }),
             }),
             core::iter::empty(),
@@ -231,6 +233,7 @@ struct DeviceConfigInner {
     blocking: bool,
     shared_tags: bool,
     shared_tag_set: Arc<TagSet<NullBlkDevice>>,
+    hw_queue_depth: u32,
 }
 
 #[vtable]
@@ -274,6 +277,7 @@ impl configfs::AttributeOperations<0> for DeviceConfig {
                     blocking: guard.blocking,
                     memory_backed: guard.memory_backed,
                     no_sched: guard.no_sched,
+                    hw_queue_depth: guard.hw_queue_depth,
                 },
             })?);
             guard.powered = true;
@@ -447,3 +451,4 @@ configfs_attribute!(DeviceConfig, 15,
 configfs_simple_field!(DeviceConfig, 16, mbps, u32);
 configfs_simple_bool_field!(DeviceConfig, 17, blocking);
 configfs_simple_bool_field!(DeviceConfig, 18, shared_tags);
+configfs_simple_field!(DeviceConfig, 19, hw_queue_depth, u32);
