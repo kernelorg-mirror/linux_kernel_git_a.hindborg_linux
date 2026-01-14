@@ -85,6 +85,13 @@ impl DiskStorage {
             remaining_bytes -= processed;
         }
     }
+
+    pub(crate) fn flush(&self, hw_data: &Pin<&SpinLock<HwQueueContext>>) -> Result {
+        let mut tree_guard = self.lock();
+        let mut hw_data_guard = hw_data.lock();
+        let mut access = self.access(&mut tree_guard, &mut hw_data_guard, None);
+        access.flush()
+    }
 }
 
 pub(crate) struct DiskStorageAccess<'a, 'b, 'c> {
@@ -120,18 +127,32 @@ impl<'a, 'b, 'c> DiskStorageAccess<'a, 'b, 'c> {
         (index << block::PAGE_SECTORS_SHIFT) as u64
     }
 
+    fn extract_cache_page(&mut self) -> Result<Option<KBox<NullBlockPage>>> {
+        Self::extract_cache_page_inner(
+            &mut self.cache_guard,
+            &mut self.disk_guard,
+            self.disk_storage,
+            self.hw_data_guard,
+            self.sheaf.as_mut(),
+        )
+    }
+
     fn extract_cache_page_inner<'g>(
         cache_guard: &mut xarray::Guard<'g, TreeNode>,
         disk_guard: &mut xarray::Guard<'g, TreeNode>,
         disk_storage: &DiskStorage,
         hw_data: &mut HwQueueContext,
         sheaf: Option<&mut XArraySheaf<'_>>,
-    ) -> Result<KBox<NullBlockPage>> {
-        let cache_entry = cache_guard
-            .find_next_entry_circular(
-                disk_storage.next_flush_sector.load(ordering::Relaxed) as usize
-            )
-            .expect("Expected to find a page in the cache");
+    ) -> Result<Option<KBox<NullBlockPage>>> {
+        let cache_entry = cache_guard.find_next_entry_circular(
+            disk_storage.next_flush_sector.load(ordering::Relaxed) as usize,
+        );
+
+        let cache_entry = if let Some(entry) = cache_entry {
+            entry
+        } else {
+            return Ok(None);
+        };
 
         let index = cache_entry.index();
 
@@ -172,7 +193,16 @@ impl<'a, 'b, 'c> DiskStorageAccess<'a, 'b, 'c> {
             }
         };
 
-        Ok(page)
+        Ok(Some(page))
+    }
+
+    fn flush(&mut self) -> Result {
+        if self.disk_storage.cache_size > 0 {
+            while let Some(page) = self.extract_cache_page()? {
+                drop(page);
+            }
+        }
+        Ok(())
     }
 
     fn get_cache_page(&mut self, sector: u64) -> Result<&mut NullBlockPage> {
@@ -197,6 +227,7 @@ impl<'a, 'b, 'c> DiskStorageAccess<'a, 'b, 'c> {
                         self.hw_data_guard,
                         self.sheaf.as_mut(),
                     )?
+                    .expect("Expected to find a page in the cache")
                 };
                 let xarray::Entry::Vacant(vacant_entry) = cache_guard.entry(index) else {
                     unreachable!("slot was vacant and we hold the lock")
