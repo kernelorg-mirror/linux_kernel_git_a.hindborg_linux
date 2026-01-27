@@ -798,7 +798,7 @@ impl NullBlkDevice {
         if self.memory_backed {
             memalloc_scope!(let _noio: NoIo);
             if rq.command() == mq::Command::Discard {
-                self.storage.discard(hw_data, rq.sector(), sectors);
+                self.storage.discard(rq.sector(), sectors);
             } else {
                 self.transfer(hw_data, rq, rq.command(), sectors)?;
             }
