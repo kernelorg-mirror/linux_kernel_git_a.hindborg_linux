@@ -216,6 +216,10 @@ module! {
             default: false,
             description: "Set alignment requirement for IO buffers to be page size.",
         },
+        shared_tag_bitmap: bool {
+            default: false,
+            description: "Use shared tag bitmap for all submission queues for blk-mq.",
+        },
     },
 }
 
@@ -245,6 +249,7 @@ impl kernel::InPlaceModule for NullBlkModule {
             let memory_backed = module_parameters::memory_backed.value();
             let no_sched = module_parameters::no_sched.value();
             let hw_queue_depth = module_parameters::hw_queue_depth.value();
+            let shared_tag_bitmap = module_parameters::shared_tag_bitmap.value();
 
             let shared_tag_set = NullBlkDevice::build_tag_set(TagSetOptions {
                 home_node,
@@ -258,6 +263,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                 blocking,
                 memory_backed,
                 no_sched,
+                shared_tag_bitmap,
                 hw_queue_depth,
                 #[cfg(CONFIG_BLK_DEV_RUST_NULL_FAULT_INJECTION)]
                 init_hctx_inject: Arc::pin_init(
@@ -300,6 +306,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                         blocking,
                         memory_backed,
                         no_sched,
+                        shared_tag_bitmap,
                         hw_queue_depth,
                         #[cfg(CONFIG_BLK_DEV_RUST_NULL_FAULT_INJECTION)]
                         init_hctx_inject: Arc::pin_init(
@@ -404,6 +411,7 @@ struct TagSetOptions {
     blocking: bool,
     memory_backed: bool,
     no_sched: bool,
+    shared_tag_bitmap: bool,
     hw_queue_depth: u32,
     #[cfg(CONFIG_BLK_DEV_RUST_NULL_FAULT_INJECTION)]
     init_hctx_inject: Arc<FaultConfig>,
@@ -419,6 +427,7 @@ impl NullBlkDevice {
             blocking,
             memory_backed,
             no_sched,
+            shared_tag_bitmap,
             hw_queue_depth,
             #[cfg(CONFIG_BLK_DEV_RUST_NULL_FAULT_INJECTION)]
             init_hctx_inject,
@@ -440,6 +449,9 @@ impl NullBlkDevice {
         }
         if no_sched {
             flags |= mq::tag_set::Flag::NoDefaultScheduler;
+        }
+        if shared_tag_bitmap {
+            flags |= mq::tag_set::Flag::TagHctxShared;
         }
 
         let queue_config_guard = queue_config.lock();
