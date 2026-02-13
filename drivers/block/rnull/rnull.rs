@@ -191,6 +191,10 @@ module! {
             default: 0,
             description: "Number of IOPOLL submission queues.",
         },
+        fua: bool {
+            default: true,
+            description: "Enable/disable FUA support when cache_size is used.",
+        },
     },
 }
 
@@ -267,6 +271,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                     zone_max_open: module_parameters::zone_max_open.value(),
                     zone_max_active: module_parameters::zone_max_active.value(),
                     zone_append_max_sectors: module_parameters::zone_append_max_sectors.value(),
+                    forced_unit_access: module_parameters::fua.value(),
                 })?;
                 disks.push(disk, GFP_KERNEL)?;
             }
@@ -307,6 +312,7 @@ struct NullBlkOptions<'a> {
     zone_max_active: u32,
     #[cfg_attr(not(CONFIG_BLK_DEV_ZONED), allow(dead_code))]
     zone_append_max_sectors: u32,
+    forced_unit_access: bool,
 }
 
 #[pin_data]
@@ -422,6 +428,7 @@ impl NullBlkDevice {
             zone_max_active,
             #[cfg_attr(not(CONFIG_BLK_DEV_ZONED), allow(unused_variables))]
             zone_append_max_sectors,
+            forced_unit_access,
         } = options;
 
         let memory_backed = tag_set.memory_backed;
@@ -439,9 +446,10 @@ impl NullBlkDevice {
             return Err(code::EINVAL);
         }
 
+        let s = storage.clone();
         let queue_data = Arc::try_pin_init(
             try_pin_init!(Self {
-                storage,
+                storage: s,
                 irq_mode,
                 completion_time,
                 memory_backed,
@@ -474,7 +482,9 @@ impl NullBlkDevice {
             .capacity_sectors(device_capacity_sectors)
             .logical_block_size(block_size_bytes)?
             .physical_block_size(block_size_bytes)?
-            .rotational(rotational);
+            .rotational(rotational)
+            .write_cache(storage.cache_enabled())
+            .forced_unit_access(forced_unit_access && storage.cache_enabled());
 
         #[cfg(CONFIG_BLK_DEV_ZONED)]
         {
@@ -553,6 +563,7 @@ impl NullBlkDevice {
         hw_data_guard: &'b mut SpinLockGuard<'c, HwQueueContext>,
         mut sector: u64,
         mut segment: Segment<'_>,
+        bypass_cache: bool,
     ) -> Result {
         let mut sheaf: Option<XArraySheaf<'_>> = None;
 
@@ -561,7 +572,13 @@ impl NullBlkDevice {
 
             let mut access = self.storage.access(tree_guard, hw_data_guard, sheaf);
 
-            let page = access.get_write_page(sector)?;
+            if bypass_cache {
+                if let Some(page) = access.get_cache_page(sector) {
+                    page.set_free(sector);
+                }
+            }
+
+            let page = access.get_write_page(sector, bypass_cache)?;
             page.set_occupied(sector);
 
             // CAST: Page offset always fits in 32 bits.
@@ -569,7 +586,11 @@ impl NullBlkDevice {
                 ((sector & u64::from(block::PAGE_SECTOR_MASK)) << block::SECTOR_SHIFT) as usize;
 
             // CAST: Casting from `usize` to `u64` never overflows.
-            sector += segment.copy_to_page(page.page_mut().as_pin_mut(), page_offset) as u64
+            sector += segment.copy_to_page_limit(
+                page.page_mut().as_pin_mut(),
+                page_offset,
+                self.block_size_bytes.try_into()?,
+            ) as u64
                 >> block::SECTOR_SHIFT;
 
             sheaf = access.sheaf;
@@ -632,6 +653,8 @@ impl NullBlkDevice {
         let mut hw_data_guard = hw_data.lock();
         let mut tree_guard = self.storage.lock();
 
+        let skip_cache = rq.flags().contains(mq::RequestFlag::ForcedUnitAccess);
+
         for bio in rq.bio_iter_mut() {
             let segment_iter = bio.segment_iter();
             for mut segment in segment_iter {
@@ -641,9 +664,13 @@ impl NullBlkDevice {
                 let length_sectors_allowed = segment_length_sectors.min(max_remaining_sectors);
                 segment.truncate(length_sectors_allowed << SECTOR_SHIFT);
                 match command {
-                    mq::Command::Write => {
-                        self.write(&mut tree_guard, &mut hw_data_guard, sector, segment)?
-                    }
+                    mq::Command::Write => self.write(
+                        &mut tree_guard,
+                        &mut hw_data_guard,
+                        sector,
+                        segment,
+                        skip_cache,
+                    )?,
                     mq::Command::Read => {
                         self.read(&mut tree_guard, &mut hw_data_guard, sector, segment)?
                     }

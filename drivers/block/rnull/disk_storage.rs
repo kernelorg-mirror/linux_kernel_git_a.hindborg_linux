@@ -92,6 +92,10 @@ impl DiskStorage {
         let mut access = self.access(&mut tree_guard, &mut hw_data_guard, None);
         access.flush()
     }
+
+    pub(crate) fn cache_enabled(&self) -> bool {
+        self.cache_size > 0
+    }
 }
 
 pub(crate) struct DiskStorageAccess<'a, 'b, 'c> {
@@ -205,7 +209,7 @@ impl<'a, 'b, 'c> DiskStorageAccess<'a, 'b, 'c> {
         Ok(())
     }
 
-    fn get_cache_page(&mut self, sector: u64) -> Result<&mut NullBlockPage> {
+    fn get_or_alloc_cache_page(&mut self, sector: u64) -> Result<&mut NullBlockPage> {
         let index = Self::to_index(sector);
 
         match self.cache_guard.entry(index) {
@@ -239,6 +243,12 @@ impl<'a, 'b, 'c> DiskStorageAccess<'a, 'b, 'c> {
         }
     }
 
+    pub(crate) fn get_cache_page(&mut self, sector: u64) -> Option<&mut NullBlockPage> {
+        let index = Self::to_index(sector);
+
+        self.cache_guard.get_mut(index)
+    }
+
     fn get_disk_page(&mut self, sector: u64) -> Result<&mut NullBlockPage> {
         let index = Self::to_index(sector);
 
@@ -256,9 +266,13 @@ impl<'a, 'b, 'c> DiskStorageAccess<'a, 'b, 'c> {
         Ok(page)
     }
 
-    pub(crate) fn get_write_page(&mut self, sector: u64) -> Result<&mut NullBlockPage> {
-        let page = if self.disk_storage.cache_size > 0 {
-            self.get_cache_page(sector)?
+    pub(crate) fn get_write_page(
+        &mut self,
+        sector: u64,
+        bypass_cache: bool,
+    ) -> Result<&mut NullBlockPage> {
+        let page = if self.disk_storage.cache_size > 0 && !bypass_cache {
+            self.get_or_alloc_cache_page(sector)?
         } else {
             self.get_disk_page(sector)?
         };
