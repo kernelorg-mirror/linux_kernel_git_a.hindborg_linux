@@ -10,7 +10,10 @@ mod util;
 #[cfg(CONFIG_BLK_DEV_ZONED)]
 mod zoned;
 
-use configfs::IRQMode;
+use configfs::{
+    IRQMode,
+    QueueConfig, //
+};
 use disk_storage::{
     DiskStorage,
     NullBlockPage,
@@ -224,9 +227,14 @@ impl kernel::InPlaceModule for NullBlkModule {
             let hw_queue_depth = module_parameters::hw_queue_depth.value();
 
             let shared_tag_set = NullBlkDevice::build_tag_set(TagSetOptions {
-                submit_queues,
-                poll_queues,
                 home_node,
+                queue_config: Arc::pin_init(
+                    new_mutex!(QueueConfig {
+                        submit_queues,
+                        poll_queues,
+                    }),
+                    GFP_KERNEL,
+                )?,
                 blocking,
                 memory_backed,
                 no_sched,
@@ -256,9 +264,14 @@ impl kernel::InPlaceModule for NullBlkModule {
                         .value()
                         .then(|| shared_tag_set.clone()),
                     tag_set: TagSetOptions {
-                        submit_queues,
-                        poll_queues,
                         home_node,
+                        queue_config: Arc::pin_init(
+                            new_mutex!(QueueConfig {
+                                submit_queues,
+                                poll_queues,
+                            }),
+                            GFP_KERNEL,
+                        )?,
                         blocking,
                         memory_backed,
                         no_sched,
@@ -338,9 +351,8 @@ struct NullBlkDevice {
 }
 
 struct TagSetOptions {
-    submit_queues: u32,
-    poll_queues: u32,
     home_node: i32,
+    queue_config: Arc<Mutex<QueueConfig>>,
     blocking: bool,
     memory_backed: bool,
     no_sched: bool,
@@ -352,9 +364,8 @@ impl NullBlkDevice {
 
     fn build_tag_set(options: TagSetOptions) -> Result<Arc<TagSet<Self>>> {
         let TagSetOptions {
-            submit_queues,
-            poll_queues,
             home_node,
+            queue_config,
             blocking,
             memory_backed,
             no_sched,
@@ -379,14 +390,18 @@ impl NullBlkDevice {
             flags |= mq::tag_set::Flag::NoDefaultScheduler;
         }
 
+        let queue_config_guard = queue_config.lock();
+        let submit_queues = queue_config_guard.submit_queues;
+        let poll_queues = queue_config_guard.poll_queues;
+        drop(queue_config_guard);
+
         Arc::pin_init(
             TagSet::new(
                 submit_queues + poll_queues,
                 KBox::new(
                     NullBlkTagsetData {
                         queue_depth: hw_queue_depth,
-                        submit_queue_count: submit_queues,
-                        poll_queue_count: poll_queues,
+                        queue_config,
                     },
                     GFP_KERNEL,
                 )?,
@@ -823,8 +838,7 @@ kernel::impl_has_hr_timer! {
 
 struct NullBlkTagsetData {
     queue_depth: u32,
-    submit_queue_count: u32,
-    poll_queue_count: u32,
+    queue_config: Arc<Mutex<QueueConfig>>,
 }
 
 #[vtable]
@@ -970,8 +984,10 @@ impl Operations for NullBlkDevice {
     }
 
     fn map_queues(tag_set: Pin<&mut TagSet<Self>>) {
-        let mut submit_queue_count = tag_set.data().submit_queue_count;
-        let mut poll_queue_count = tag_set.data().poll_queue_count;
+        let queue_config = tag_set.data().queue_config.lock();
+        let mut submit_queue_count = queue_config.submit_queues;
+        let mut poll_queue_count = queue_config.poll_queues;
+        drop(queue_config);
 
         if tag_set.hw_queue_count() != submit_queue_count + poll_queue_count {
             pr_warn!(

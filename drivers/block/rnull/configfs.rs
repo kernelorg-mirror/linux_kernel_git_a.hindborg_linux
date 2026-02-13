@@ -148,7 +148,13 @@ impl configfs::GroupOperations for Config {
                     completion_time: time::Delta::ZERO,
                     name: name.try_into()?,
                     memory_backed: false,
-                    submit_queues: 1,
+                    queue_config: Arc::pin_init(
+                        new_mutex!(QueueConfig {
+                            submit_queues: 1,
+                            poll_queues: 0
+                        }),
+                        GFP_KERNEL
+                    )?,
                     home_node: bindings::NUMA_NO_NODE,
                     discard: false,
                     no_sched: false,
@@ -169,7 +175,6 @@ impl configfs::GroupOperations for Config {
                     zone_max_open: 0,
                     zone_max_active: 0,
                     zone_append_max_sectors: u32::MAX,
-                    poll_queues: 0,
                     fua: true,
                 }),
             }),
@@ -236,7 +241,7 @@ struct DeviceConfigInner {
     completion_time: time::Delta,
     disk: Option<Arc<GenDisk<NullBlkDevice>>>,
     memory_backed: bool,
-    submit_queues: u32,
+    queue_config: Arc<Mutex<QueueConfig>>,
     home_node: i32,
     discard: bool,
     no_sched: bool,
@@ -257,7 +262,6 @@ struct DeviceConfigInner {
     zone_max_open: u32,
     zone_max_active: u32,
     zone_append_max_sectors: u32,
-    poll_queues: u32,
     fua: bool,
 }
 
@@ -310,9 +314,8 @@ impl configfs::AttributeOperations<0> for DeviceConfig {
                 bandwidth_limit: u64::from(guard.mbps) * 2u64.pow(20),
                 shared_tag_set: guard.shared_tags.then(|| guard.shared_tag_set.clone()),
                 tag_set: crate::TagSetOptions {
-                    submit_queues: guard.submit_queues,
-                    poll_queues: guard.poll_queues,
                     home_node: guard.home_node,
+                    queue_config: guard.queue_config.clone(),
                     blocking: guard.blocking,
                     memory_backed: guard.memory_backed,
                     no_sched: guard.no_sched,
@@ -337,9 +340,17 @@ impl configfs::AttributeOperations<0> for DeviceConfig {
     }
 }
 
-configfs_simple_field!(DeviceConfig, 1,
-                       block_size, u32,
-                       check GenDiskBuilder::<NullBlkDevice>::validate_block_size
+pub(crate) struct QueueConfig {
+    pub(crate) submit_queues: u32,
+    pub(crate) poll_queues: u32,
+}
+
+configfs_simple_field!(
+    DeviceConfig,
+    1,
+    block_size,
+    u32,
+    check GenDiskBuilder::<NullBlkDevice>::validate_block_size
 );
 configfs_simple_bool_field!(DeviceConfig, 2, rotational);
 configfs_simple_field!(DeviceConfig, 3, capacity_mib, u64);
@@ -363,38 +374,44 @@ impl core::str::FromStr for IRQMode {
 
 configfs_simple_bool_field!(DeviceConfig, 6, memory_backed);
 
-#[vtable]
-impl configfs::AttributeOperations<7> for DeviceConfig {
-    type Data = DeviceConfig;
-
-    fn show(this: &DeviceConfig, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
-        let mut writer = kernel::str::Formatter::new(page);
-        writer.write_fmt(fmt!("{}\n", this.data.lock().submit_queues))?;
-        Ok(writer.bytes_written())
-    }
-
-    fn store(this: &DeviceConfig, page: &[u8]) -> Result {
-        if this.data.lock().powered {
-            return Err(EBUSY);
-        }
+configfs_attribute! {
+    DeviceConfig,
+    7,
+    show: |this, page| show_field(this.data.lock().queue_config.lock().submit_queues, page),
+    store: |this,page| {
+        let config_guard = this.data.lock();
+        let mut queue_config = config_guard.queue_config.lock();
 
         let text = core::str::from_utf8(page)?.trim();
-        let value = text
-            .parse::<u32>()
-            .map_err(|_| kernel::error::code::EINVAL)?;
-
-        if value == 0 || value > kernel::cpu::num_possible_cpus() {
-            return Err(kernel::error::code::EINVAL);
+        let value = text.parse().map_err(|_| EINVAL)?;
+        if value > kernel::cpu::num_possible_cpus() {
+            return Err(kernel::error::code::EINVAL)
         }
 
-        this.data.lock().submit_queues = value;
+        let old_submit_queues = queue_config.submit_queues;
+        queue_config.submit_queues = value;
+        let total_queue_count = queue_config.submit_queues + queue_config.poll_queues;
+
+        let disk = config_guard.disk.clone();
+
+        drop(queue_config);
+        drop(config_guard);
+
+        if let Some(disk) = &disk {
+            if let Err(e) = disk.tag_set().update_hw_queue_count(total_queue_count) {
+                this.data.lock().queue_config.lock().submit_queues = old_submit_queues;
+                return Err(e);
+            }
+        }
+
         Ok(())
-    }
+    },
 }
 
 configfs_attribute!(DeviceConfig, 8,
     show: |this, page| show_field(
-        this.data.lock().submit_queues == kernel::numa::num_online_nodes(), page
+        this.data.lock().queue_config.lock().submit_queues == kernel::numa::num_online_nodes(),
+        page
     ),
     store: |this, page| store_with_power_check(this, page, |data, page| {
         let value = core::str::from_utf8(page)?
@@ -404,7 +421,7 @@ configfs_attribute!(DeviceConfig, 8,
             != 0;
 
         if value {
-            data.submit_queues = kernel::numa::num_online_nodes();
+            data.queue_config.lock().submit_queues = kernel::numa::num_online_nodes();
         }
         Ok(())
     })
@@ -506,17 +523,37 @@ configfs_simple_field!(DeviceConfig, 23, zone_nr_conv, u32);
 configfs_simple_field!(DeviceConfig, 24, zone_max_open, u32);
 configfs_simple_field!(DeviceConfig, 25, zone_max_active, u32);
 configfs_simple_field!(DeviceConfig, 26, zone_append_max_sectors, u32);
-configfs_simple_field!(
+configfs_attribute! {
     DeviceConfig,
     27,
-    poll_queues,
-    u32,
-    check(|value| {
+    show: |this, page| show_field(this.data.lock().queue_config.lock().poll_queues, page),
+    store: |this,page| {
+        let config_guard = this.data.lock();
+        let mut queue_config = config_guard.queue_config.lock();
+
+        let text = core::str::from_utf8(page)?.trim();
+        let value = text.parse().map_err(|_| EINVAL)?;
         if value > kernel::cpu::num_possible_cpus() {
-            Err(kernel::error::code::EINVAL)
-        } else {
-            Ok(())
+            return Err(kernel::error::code::EINVAL)
         }
-    })
-);
+
+        let old_poll_queues = queue_config.poll_queues;
+        queue_config.poll_queues = value;
+        let total_queue_count = queue_config.submit_queues + queue_config.poll_queues;
+
+        let disk = config_guard.disk.clone();
+
+        drop(queue_config);
+        drop(config_guard);
+
+        if let Some(disk) = &disk {
+            if let Err(e) = disk.tag_set().update_hw_queue_count(total_queue_count) {
+                this.data.lock().queue_config.lock().poll_queues = old_poll_queues;
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    },
+}
 configfs_simple_bool_field!(DeviceConfig, 28, fua);
