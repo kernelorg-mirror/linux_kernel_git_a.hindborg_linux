@@ -170,6 +170,20 @@ impl<T: Operations> TagSet<T> {
         unsafe { (*self.inner.get()).nr_hw_queues }
     }
 
+    /// Update the number of hardware queues for this tag set.
+    ///
+    /// This operation may fail if memory for tags cannot be allocated.
+    pub fn update_hw_queue_count(&self, nr_hw_queues: u32) -> Result {
+        // SAFETY: blk_mq_update_nr_hw_queues applies internal synchronization.
+        unsafe { bindings::blk_mq_update_nr_hw_queues(self.inner.get(), nr_hw_queues) }
+
+        if self.hw_queue_count() == nr_hw_queues {
+            Ok(())
+        } else {
+            Err(ENOMEM)
+        }
+    }
+
     /// Borrow the [`T::TagSetData`] associated with this tag set.
     pub fn data(&self) -> <T::TagSetData as ForeignOwnable>::Borrowed<'_> {
         // SAFETY: By type invariant, `self.inner` is valid.
