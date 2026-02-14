@@ -138,4 +138,7 @@ pub use request::{
     RequestTimerHandle, //
 };
 pub use request_queue::RequestQueue;
-pub use tag_set::TagSet;
+pub use tag_set::{
+    QueueType,
+    TagSet, //
+};
