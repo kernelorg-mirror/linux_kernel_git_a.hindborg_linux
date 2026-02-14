@@ -9,6 +9,7 @@ use crate::{
     bindings,
     block::mq::{
         operations::OperationsVTable,
+        Feature,
         Operations,
         RequestQueue,
         TagSet, //
@@ -55,6 +56,8 @@ pub struct GenDiskBuilder<T> {
     zone_size_sectors: u32,
     #[cfg(CONFIG_BLK_DEV_ZONED)]
     zone_append_max_sectors: u32,
+    write_cache: bool,
+    forced_unit_access: bool,
     _p: PhantomData<T>,
 }
 
@@ -72,6 +75,8 @@ impl<T> Default for GenDiskBuilder<T> {
             zone_size_sectors: 0,
             #[cfg(CONFIG_BLK_DEV_ZONED)]
             zone_append_max_sectors: 0,
+            write_cache: false,
+            forced_unit_access: false,
             _p: PhantomData,
         }
     }
@@ -164,6 +169,18 @@ impl<T: Operations> GenDiskBuilder<T> {
         self
     }
 
+    /// Declare that this device supports forced unit access.
+    pub fn forced_unit_access(mut self, enable: bool) -> Self {
+        self.forced_unit_access = enable;
+        self
+    }
+
+    /// Declare that this device has a write-back cache.
+    pub fn write_cache(mut self, enable: bool) -> Self {
+        self.write_cache = enable;
+        self
+    }
+
     /// Build a new `GenDisk` and add it to the VFS.
     pub fn build(
         self,
@@ -183,7 +200,7 @@ impl<T: Operations> GenDiskBuilder<T> {
         lim.physical_block_size = self.physical_block_size;
         lim.max_hw_discard_sectors = self.max_hw_discard_sectors;
         if self.rotational {
-            lim.features |= bindings::BLK_FEAT_ROTATIONAL;
+            lim.features = Feature::Rotational.into();
         }
 
         #[cfg(CONFIG_BLK_DEV_ZONED)]
@@ -192,9 +209,17 @@ impl<T: Operations> GenDiskBuilder<T> {
                 return Err(error::code::EINVAL);
             }
 
-            lim.features |= bindings::BLK_FEAT_ZONED;
+            lim.features |= Feature::Zoned;
             lim.chunk_sectors = self.zone_size_sectors;
             lim.max_hw_zone_append_sectors = self.zone_append_max_sectors;
+        }
+
+        if self.write_cache {
+            lim.features |= Feature::WriteCache;
+        }
+
+        if self.forced_unit_access {
+            lim.features |= Feature::ForcedUnitAccess;
         }
 
         // SAFETY: `tagset.raw_tag_set()` points to a valid and initialized tag set
