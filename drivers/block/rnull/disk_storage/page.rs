@@ -20,11 +20,11 @@ static_assert!((PAGE_SIZE >> SECTOR_SHIFT) <= 64);
 pub(crate) struct NullBlockPage {
     page: Owned<SafePage>,
     status: u64,
-    block_size: usize,
+    block_size: u32,
 }
 
 impl NullBlockPage {
-    pub(crate) fn new(block_size: usize) -> Result<KBox<Self>> {
+    pub(crate) fn new(block_size: u32) -> Result<KBox<Self>> {
         memalloc_scope!(let _noio: NoIo);
         Ok(KBox::new(
             Self {

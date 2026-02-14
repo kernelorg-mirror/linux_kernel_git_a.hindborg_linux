@@ -80,7 +80,8 @@ impl AttributeOperations<0> for Config {
         let mut writer = kernel::str::Formatter::new(page);
         writer.write_str(
             "blocksize,size,rotational,irqmode,completion_nsec,memory_backed,\
-             submit_queues,use_per_node_hctx,discard,blocking,shared_tags\n",
+             submit_queues,use_per_node_hctx,discard,blocking,shared_tags,\
+             zoned,zone_size,zone_capacity\n",
         )?;
         Ok(writer.bytes_written())
     }
@@ -118,7 +119,14 @@ impl configfs::GroupOperations for Config {
                 mbps: 16,
                 blocking: 17,
                 shared_tags: 18,
-                hw_queue_depth: 19
+                hw_queue_depth: 19,
+                zoned: 20,
+                zone_size: 21,
+                zone_capacity: 22,
+                zone_nr_conv: 23,
+                zone_max_open: 24,
+                zone_max_active: 25,
+                zone_append_max_sectors: 26,
             ],
         };
 
@@ -145,16 +153,20 @@ impl configfs::GroupOperations for Config {
                     bad_blocks: Arc::pin_init(BadBlocks::new(false), GFP_KERNEL)?,
                     bad_blocks_once: false,
                     bad_blocks_partial_io: false,
-                    disk_storage: Arc::pin_init(
-                        DiskStorage::new(0, block_size as usize),
-                        GFP_KERNEL
-                    )?,
+                    disk_storage: Arc::pin_init(DiskStorage::new(0, block_size), GFP_KERNEL)?,
                     cache_size_mib: 0,
                     mbps: 0,
                     blocking: false,
                     shared_tags: false,
                     shared_tag_set: self.shared_tag_set.clone(),
                     hw_queue_depth: 64,
+                    zoned: false,
+                    zone_size_mib: 256,
+                    zone_capacity_mib: 0,
+                    zone_nr_conv: 0,
+                    zone_max_open: 0,
+                    zone_max_active: 0,
+                    zone_append_max_sectors: u32::MAX,
                 }),
             }),
             core::iter::empty(),
@@ -234,6 +246,13 @@ struct DeviceConfigInner {
     shared_tags: bool,
     shared_tag_set: Arc<TagSet<NullBlkDevice>>,
     hw_queue_depth: u32,
+    zoned: bool,
+    zone_size_mib: u32,
+    zone_capacity_mib: u32,
+    zone_nr_conv: u32,
+    zone_max_open: u32,
+    zone_max_active: u32,
+    zone_append_max_sectors: u32,
 }
 
 #[vtable]
@@ -257,11 +276,24 @@ impl configfs::AttributeOperations<0> for DeviceConfig {
         let mut guard = this.data.lock();
 
         if !guard.powered && power_op {
+            // We protect zone state with a mutex, so we require blocking queues for zone emulation.
+            if guard.shared_tags && guard.zoned {
+                if !guard
+                    .shared_tag_set
+                    .flags()
+                    .contains(kernel::block::mq::tag_set::Flag::Blocking)
+                {
+                    return Err(EINVAL);
+                }
+            } else if guard.zoned && !guard.blocking {
+                return Err(EINVAL);
+            }
+
             guard.disk = Some(NullBlkDevice::new(crate::NullBlkOptions {
                 name: &guard.name,
-                block_size: guard.block_size,
+                block_size_bytes: guard.block_size,
                 rotational: guard.rotational,
-                capacity_mib: guard.capacity_mib,
+                device_capacity_mib: guard.capacity_mib,
                 irq_mode: guard.irq_mode,
                 completion_time: guard.completion_time,
                 discard: guard.discard,
@@ -279,6 +311,13 @@ impl configfs::AttributeOperations<0> for DeviceConfig {
                     no_sched: guard.no_sched,
                     hw_queue_depth: guard.hw_queue_depth,
                 },
+                zoned: guard.zoned,
+                zone_size_mib: guard.zone_size_mib,
+                zone_capacity_mib: guard.zone_capacity_mib,
+                zone_nr_conv: guard.zone_nr_conv,
+                zone_max_open: guard.zone_max_open,
+                zone_max_active: guard.zone_max_active,
+                zone_append_max_sectors: guard.zone_append_max_sectors,
             })?);
             guard.powered = true;
         } else if guard.powered && !power_op {
@@ -442,10 +481,7 @@ configfs_attribute!(DeviceConfig, 15,
     store: |this, page| store_with_power_check(this, page, |data, page| {
         let text = core::str::from_utf8(page)?.trim();
         let value = text.parse::<u64>().map_err(|_| EINVAL)?;
-        data.disk_storage = Arc::pin_init(
-            DiskStorage::new(value, data.block_size as usize),
-            GFP_KERNEL
-        )?;
+        data.disk_storage = Arc::pin_init(DiskStorage::new(value, data.block_size), GFP_KERNEL)?;
         data.cache_size_mib = value;
         Ok(())
     })
@@ -455,3 +491,10 @@ configfs_simple_field!(DeviceConfig, 16, mbps, u32);
 configfs_simple_bool_field!(DeviceConfig, 17, blocking);
 configfs_simple_bool_field!(DeviceConfig, 18, shared_tags);
 configfs_simple_field!(DeviceConfig, 19, hw_queue_depth, u32);
+configfs_simple_bool_field!(DeviceConfig, 20, zoned);
+configfs_simple_field!(DeviceConfig, 21, zone_size_mib, u32);
+configfs_simple_field!(DeviceConfig, 22, zone_capacity_mib, u32);
+configfs_simple_field!(DeviceConfig, 23, zone_nr_conv, u32);
+configfs_simple_field!(DeviceConfig, 24, zone_max_open, u32);
+configfs_simple_field!(DeviceConfig, 25, zone_max_active, u32);
+configfs_simple_field!(DeviceConfig, 26, zone_append_max_sectors, u32);
