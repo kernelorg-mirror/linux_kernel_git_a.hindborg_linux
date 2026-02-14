@@ -132,6 +132,7 @@ pub mod tag_set;
 
 pub use operations::Operations;
 pub use request::{
+    Command,
     IdleRequest,
     Request,
     RequestTimerHandle, //
