@@ -10,9 +10,12 @@ use kernel::{
     bindings,
     block::{
         badblocks::BadBlocks,
-        mq::gen_disk::{
-            GenDisk,
-            GenDiskBuilder, //
+        mq::{
+            gen_disk::{
+                GenDisk,
+                GenDiskBuilder, //
+            },
+            TagSet, //
         }, //
     },
     configfs::{
@@ -45,7 +48,9 @@ use macros::{
 
 mod macros;
 
-pub(crate) fn subsystem() -> impl PinInit<kernel::configfs::Subsystem<Config>, Error> {
+pub(crate) fn subsystem(
+    shared_tag_set: Arc<TagSet<NullBlkDevice>>,
+) -> impl PinInit<kernel::configfs::Subsystem<Config>, Error> {
     let item_type = configfs_attrs! {
         container: configfs::Subsystem<Config>,
         data: Config,
@@ -55,11 +60,17 @@ pub(crate) fn subsystem() -> impl PinInit<kernel::configfs::Subsystem<Config>, E
         ],
     };
 
-    kernel::configfs::Subsystem::new(c"rnull", item_type, try_pin_init!(Config {}))
+    kernel::configfs::Subsystem::new(
+        c"rnull",
+        item_type,
+        try_pin_init!(Config { shared_tag_set }),
+    )
 }
 
 #[pin_data]
-pub(crate) struct Config {}
+pub(crate) struct Config {
+    shared_tag_set: Arc<TagSet<NullBlkDevice>>,
+}
 
 #[vtable]
 impl AttributeOperations<0> for Config {
@@ -69,7 +80,7 @@ impl AttributeOperations<0> for Config {
         let mut writer = kernel::str::Formatter::new(page);
         writer.write_str(
             "blocksize,size,rotational,irqmode,completion_nsec,memory_backed,\
-             submit_queues,use_per_node_hctx,discard,blocking\n",
+             submit_queues,use_per_node_hctx,discard,blocking,shared_tags\n",
         )?;
         Ok(writer.bytes_written())
     }
@@ -106,6 +117,7 @@ impl configfs::GroupOperations for Config {
                 cache_size_mib: 15,
                 mbps: 16,
                 blocking: 17,
+                shared_tags: 18,
             ],
         };
 
@@ -139,6 +151,8 @@ impl configfs::GroupOperations for Config {
                     cache_size_mib: 0,
                     mbps: 0,
                     blocking: false,
+                    shared_tags: false,
+                    shared_tag_set: self.shared_tag_set.clone(),
                 }),
             }),
             core::iter::empty(),
@@ -215,6 +229,8 @@ struct DeviceConfigInner {
     disk_storage: Arc<DiskStorage>,
     mbps: u32,
     blocking: bool,
+    shared_tags: bool,
+    shared_tag_set: Arc<TagSet<NullBlkDevice>>,
 }
 
 #[vtable]
@@ -245,17 +261,20 @@ impl configfs::AttributeOperations<0> for DeviceConfig {
                 capacity_mib: guard.capacity_mib,
                 irq_mode: guard.irq_mode,
                 completion_time: guard.completion_time,
-                memory_backed: guard.memory_backed,
-                submit_queues: guard.submit_queues,
-                home_node: guard.home_node,
                 discard: guard.discard,
-                no_sched: guard.no_sched,
                 bad_blocks: guard.bad_blocks.clone(),
                 bad_blocks_once: guard.bad_blocks_once,
                 bad_blocks_partial_io: guard.bad_blocks_partial_io,
                 storage: guard.disk_storage.clone(),
                 bandwidth_limit: u64::from(guard.mbps) * 2u64.pow(20),
-                blocking: guard.blocking,
+                shared_tag_set: guard.shared_tags.then(|| guard.shared_tag_set.clone()),
+                tag_set: crate::TagSetOptions {
+                    submit_queues: guard.submit_queues,
+                    home_node: guard.home_node,
+                    blocking: guard.blocking,
+                    memory_backed: guard.memory_backed,
+                    no_sched: guard.no_sched,
+                },
             })?);
             guard.powered = true;
         } else if guard.powered && !power_op {
@@ -427,3 +446,4 @@ configfs_attribute!(DeviceConfig, 15,
 
 configfs_simple_field!(DeviceConfig, 16, mbps, u32);
 configfs_simple_bool_field!(DeviceConfig, 17, blocking);
+configfs_simple_bool_field!(DeviceConfig, 18, shared_tags);

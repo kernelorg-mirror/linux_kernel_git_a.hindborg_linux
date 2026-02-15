@@ -143,6 +143,10 @@ module! {
             default: false,
             description: "Register as a blocking blk-mq driver device",
         },
+        shared_tags: bool {
+            default: false,
+            description: "Share tag set between devices for blk-mq",
+        },
     },
 }
 
@@ -158,18 +162,29 @@ impl kernel::InPlaceModule for NullBlkModule {
     fn init(_module: &'static ThisModule) -> impl PinInit<Self, Error> {
         pr_info!("Rust null_blk loaded\n");
 
-        let mut disks = KVec::new();
+        pin_init::pin_init_scope(move || -> Result<_, Error> {
+            let submit_queues = if module_parameters::use_per_node_hctx.value() {
+                kernel::numa::num_online_nodes()
+            } else {
+                module_parameters::submit_queues.value()
+            };
+            let home_node = module_parameters::home_node.value();
+            let blocking = module_parameters::blocking.value();
+            let memory_backed = module_parameters::memory_backed.value();
+            let no_sched = module_parameters::no_sched.value();
 
-        let defer_init = move || -> Result<_, Error> {
+            let shared_tag_set = NullBlkDevice::build_tag_set(TagSetOptions {
+                submit_queues,
+                home_node,
+                blocking,
+                memory_backed,
+                no_sched,
+            })?;
+
+            let mut disks = KVec::new();
             let completion_time: i64 = module_parameters::completion_nsec.value().try_into()?;
             for i in 0..module_parameters::nr_devices.value() {
                 let name = CString::try_from_fmt(fmt!("rnullb{}", i))?;
-
-                let submit_queues = if module_parameters::use_per_node_hctx.value() {
-                    kernel::numa::num_online_nodes()
-                } else {
-                    module_parameters::submit_queues.value()
-                };
 
                 let block_size = module_parameters::bs.value();
                 let disk = NullBlkDevice::new(NullBlkOptions {
@@ -179,27 +194,30 @@ impl kernel::InPlaceModule for NullBlkModule {
                     capacity_mib: module_parameters::gb.value() * 1024,
                     irq_mode: module_parameters::irqmode.value().try_into()?,
                     completion_time: Delta::from_nanos(completion_time),
-                    memory_backed: module_parameters::memory_backed.value(),
-                    submit_queues,
-                    home_node: module_parameters::home_node.value(),
                     discard: module_parameters::discard.value(),
-                    no_sched: module_parameters::no_sched.value(),
                     bad_blocks: Arc::pin_init(BadBlocks::new(false), GFP_KERNEL)?,
                     bad_blocks_once: false,
                     bad_blocks_partial_io: false,
                     storage: Arc::pin_init(DiskStorage::new(0, block_size as usize), GFP_KERNEL)?,
                     bandwidth_limit: u64::from(module_parameters::mbps.value()) * 2u64.pow(20),
-                    blocking: module_parameters::blocking.value(),
+                    shared_tag_set: module_parameters::shared_tags
+                        .value()
+                        .then(|| shared_tag_set.clone()),
+                    tag_set: TagSetOptions {
+                        submit_queues,
+                        home_node,
+                        blocking,
+                        memory_backed,
+                        no_sched,
+                    },
                 })?;
                 disks.push(disk, GFP_KERNEL)?;
             }
 
-            Ok(disks)
-        };
-
-        try_pin_init!(Self {
-            configfs_subsystem <- configfs::subsystem(),
-            param_disks <- new_mutex!(defer_init()?),
+            Ok(try_pin_init!(Self {
+                configfs_subsystem <- configfs::subsystem(shared_tag_set),
+                param_disks <- new_mutex!(disks),
+            }))
         })
     }
 }
@@ -211,17 +229,14 @@ struct NullBlkOptions<'a> {
     capacity_mib: u64,
     irq_mode: IRQMode,
     completion_time: Delta,
-    memory_backed: bool,
-    submit_queues: u32,
-    home_node: i32,
     discard: bool,
-    no_sched: bool,
     bad_blocks: Arc<BadBlocks>,
     bad_blocks_once: bool,
     bad_blocks_partial_io: bool,
     storage: Arc<DiskStorage>,
     bandwidth_limit: u64,
-    blocking: bool,
+    shared_tag_set: Option<Arc<TagSet<NullBlkDevice>>>,
+    tag_set: TagSetOptions,
 }
 
 #[pin_data]
@@ -243,39 +258,25 @@ struct NullBlkDevice {
     disk: SetOnce<Arc<Revocable<GenDiskRef<Self>>>>,
 }
 
+struct TagSetOptions {
+    submit_queues: u32,
+    home_node: i32,
+    blocking: bool,
+    memory_backed: bool,
+    no_sched: bool,
+}
+
 impl NullBlkDevice {
     const BANDWIDTH_TIMER_INTERVAL: Delta = Delta::from_millis(20);
 
-    fn new(options: NullBlkOptions<'_>) -> Result<Arc<GenDisk<Self>>> {
-        let NullBlkOptions {
-            name,
-            block_size,
-            rotational,
-            capacity_mib,
-            irq_mode,
-            completion_time,
-            memory_backed,
+    fn build_tag_set(options: TagSetOptions) -> Result<Arc<TagSet<Self>>> {
+        let TagSetOptions {
             submit_queues,
             home_node,
-            discard,
-            no_sched,
-            bad_blocks,
-            bad_blocks_once,
-            bad_blocks_partial_io,
-            storage,
-            bandwidth_limit,
             blocking,
+            memory_backed,
+            no_sched,
         } = options;
-
-        let mut flags = mq::tag_set::Flags::default();
-
-        if blocking || memory_backed {
-            flags |= mq::tag_set::Flag::Blocking;
-        }
-
-        if no_sched {
-            flags |= mq::tag_set::Flag::NoDefaultScheduler;
-        }
 
         if home_node > kernel::numa::num_online_nodes().try_into()? {
             return Err(code::EINVAL);
@@ -287,17 +288,52 @@ impl NullBlkDevice {
             kernel::alloc::NumaNode::new(home_node)?
         };
 
+        let mut flags = mq::tag_set::Flags::default();
+        if blocking || memory_backed {
+            flags |= mq::tag_set::Flag::Blocking;
+        }
+        if no_sched {
+            flags |= mq::tag_set::Flag::NoDefaultScheduler;
+        }
+
+        Arc::pin_init(
+            TagSet::new(submit_queues, (), 256, 1, numa_node, flags),
+            GFP_KERNEL,
+        )
+    }
+
+    fn new(options: NullBlkOptions<'_>) -> Result<Arc<GenDisk<Self>>> {
+        let NullBlkOptions {
+            name,
+            block_size,
+            rotational,
+            capacity_mib,
+            irq_mode,
+            completion_time,
+            discard,
+            bad_blocks,
+            bad_blocks_once,
+            bad_blocks_partial_io,
+            storage,
+            bandwidth_limit,
+            shared_tag_set,
+            tag_set,
+        } = options;
+
+        let memory_backed = tag_set.memory_backed;
+
+        let tagset = if let Some(shared) = shared_tag_set {
+            shared
+        } else {
+            Self::build_tag_set(tag_set)?
+        };
+
         let capacity_sectors = capacity_mib << (20 - block::SECTOR_SHIFT);
 
         // Prevent overflow in usize/u64 casts
         if usize::BITS == 32 && capacity_sectors > u32::MAX.into() {
             return Err(code::EINVAL);
         }
-
-        let tagset = Arc::pin_init(
-            TagSet::new(submit_queues, (), 256, 1, numa_node, flags),
-            GFP_KERNEL,
-        )?;
 
         let queue_data = Arc::try_pin_init(
             try_pin_init!(Self {
