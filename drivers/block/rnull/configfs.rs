@@ -132,6 +132,7 @@ impl configfs::GroupOperations for Config {
                 zone_append_max_sectors: 26,
                 poll_queues: 27,
                 fua: 28,
+                max_sectors: 29,
             ],
         };
 
@@ -219,6 +220,7 @@ impl configfs::GroupOperations for Config {
                     requeue_inject,
                     #[cfg(CONFIG_BLK_DEV_RUST_NULL_FAULT_INJECTION)]
                     init_hctx_inject,
+                    max_sectors: 0,
                 }),
             }),
             default_groups,
@@ -312,6 +314,7 @@ struct DeviceConfigInner {
     requeue_inject: Arc<FaultConfig>,
     #[cfg(CONFIG_BLK_DEV_RUST_NULL_FAULT_INJECTION)]
     init_hctx_inject: Arc<FaultConfig>,
+    max_sectors: u32,
 }
 
 #[vtable]
@@ -384,6 +387,7 @@ impl configfs::AttributeOperations<0> for DeviceConfig {
                 requeue_inject: guard.requeue_inject.clone(),
                 #[cfg(CONFIG_BLK_DEV_RUST_NULL_FAULT_INJECTION)]
                 timeout_inject: guard.timeout_inject.clone(),
+                max_sectors: guard.max_sectors,
             })?);
             guard.powered = true;
         } else if guard.powered && !power_op {
@@ -612,3 +616,4 @@ configfs_attribute! {
     },
 }
 configfs_simple_bool_field!(DeviceConfig, 28, fua);
+configfs_simple_field!(DeviceConfig, 29, max_sectors, u32);
