@@ -81,6 +81,18 @@ impl Segment<'_> {
         Ok(())
     }
 
+    /// Limit the remaining length of the segment.
+    ///
+    /// Shortens the segment to at most `new_len` bytes. If `new_len` is
+    /// greater than or equal to the current remaining length, the segment is
+    /// left unchanged. The offset is not modified, so subsequent copy
+    /// operations still start from the current position.
+    pub fn truncate(&mut self, new_len: u32) {
+        if new_len < self.len() {
+            self.bio_vec.bv_len = new_len;
+        }
+    }
+
     /// Copy data of this segment into `dst_page`.
     ///
     /// Copies data from the current offset to the next page boundary. That is `PAGE_SIZE -
