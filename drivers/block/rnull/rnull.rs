@@ -160,6 +160,7 @@ impl kernel::InPlaceModule for NullBlkModule {
                     no_sched: module_parameters::no_sched.value(),
                     bad_blocks: Arc::pin_init(BadBlocks::new(false), GFP_KERNEL)?,
                     bad_blocks_once: false,
+                    bad_blocks_partial_io: false,
                 })?;
                 disks.push(disk, GFP_KERNEL)?;
             }
@@ -188,6 +189,7 @@ struct NullBlkOptions<'a> {
     no_sched: bool,
     bad_blocks: Arc<BadBlocks>,
     bad_blocks_once: bool,
+    bad_blocks_partial_io: bool,
 }
 struct NullBlkDevice;
 
@@ -207,6 +209,7 @@ impl NullBlkDevice {
             no_sched,
             bad_blocks,
             bad_blocks_once,
+            bad_blocks_partial_io,
         } = options;
 
         let mut flags = mq::tag_set::Flags::default();
@@ -250,6 +253,7 @@ impl NullBlkDevice {
                 block_size: block_size.into(),
                 bad_blocks,
                 bad_blocks_once,
+                bad_blocks_partial_io,
             }),
             GFP_KERNEL,
         )?;
@@ -352,15 +356,66 @@ impl NullBlkDevice {
 
     #[inline(never)]
     fn transfer(
-        command: bindings::req_op,
+        rq: &mut Owned<mq::Request<Self>>,
         tree: &XArray<TreeNode>,
-        sector: u64,
-        segment: Segment<'_>,
+        max_sectors: u32,
     ) -> Result {
-        match command {
-            bindings::req_op_REQ_OP_WRITE => Self::write(tree, sector, segment)?,
-            bindings::req_op_REQ_OP_READ => Self::read(tree, sector, segment)?,
-            _ => (),
+        let mut sector = rq.sector();
+        let max_end_sector = sector + <u32 as Into<u64>>::into(max_sectors);
+        let command = rq.command();
+
+        for bio in rq.bio_iter_mut() {
+            let segment_iter = bio.segment_iter();
+            for mut segment in segment_iter {
+                // Length might be limited by bad blocks.
+                let segment_length_sectors = segment.len() >> SECTOR_SHIFT;
+                let max_remaining_sectors = (max_end_sector - sector) as u32;
+                let length_sectors_allowed = segment_length_sectors.min(max_remaining_sectors);
+                segment.truncate(length_sectors_allowed << SECTOR_SHIFT);
+                match command {
+                    bindings::req_op_REQ_OP_WRITE => Self::write(tree, sector, segment)?,
+                    bindings::req_op_REQ_OP_READ => Self::read(tree, sector, segment)?,
+                    _ => (),
+                }
+                sector += u64::from(length_sectors_allowed);
+
+                if sector >= max_end_sector {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_bad_blocks(
+        rq: &mut Owned<mq::Request<Self>>,
+        queue_data: &QueueData,
+        sectors: &mut u32,
+    ) -> Result {
+        if queue_data.bad_blocks.enabled() {
+            let start = rq.sector();
+            let end = start + u64::from(*sectors);
+            match queue_data.bad_blocks.check(start..end) {
+                badblocks::BlockStatus::None => {}
+                badblocks::BlockStatus::Acknowledged(mut range)
+                | badblocks::BlockStatus::Unacknowledged(mut range) => {
+                    rq.data_ref().error.store(1, ordering::Relaxed);
+
+                    if queue_data.bad_blocks_once {
+                        queue_data.bad_blocks.set_good(range.clone())?;
+                    }
+
+                    if queue_data.bad_blocks_partial_io {
+                        let block_size_sectors = queue_data.block_size >> SECTOR_SHIFT;
+                        range.start = align_down(range.start, block_size_sectors);
+                        if start < range.start {
+                            *sectors = (range.start - start) as u32;
+                        }
+                    } else {
+                        *sectors = 0;
+                    }
+                }
+            };
         }
         Ok(())
     }
@@ -421,6 +476,7 @@ struct QueueData {
     block_size: u64,
     bad_blocks: Arc<BadBlocks>,
     bad_blocks_once: bool,
+    bad_blocks_partial_io: bool,
 }
 
 #[pin_data]
@@ -449,6 +505,30 @@ kernel::impl_has_hr_timer! {
     }
 }
 
+fn is_power_of_two<T>(value: T) -> bool
+where
+    T: core::ops::Sub<T, Output = T>,
+    T: core::ops::BitAnd<Output = T>,
+    T: core::cmp::PartialOrd<T>,
+    T: Copy,
+    T: From<u8>,
+{
+    (value > 0u8.into()) && (value & (value - 1u8.into())) == 0u8.into()
+}
+
+fn align_down<T>(value: T, to: T) -> T
+where
+    T: core::ops::Sub<T, Output = T>,
+    T: core::ops::Not<Output = T>,
+    T: core::ops::BitAnd<Output = T>,
+    T: core::cmp::PartialOrd<T>,
+    T: Copy,
+    T: From<u8>,
+{
+    debug_assert!(is_power_of_two(to));
+    value & !(to - 1u8.into())
+}
+
 #[vtable]
 impl Operations for NullBlkDevice {
     type QueueData = Pin<KBox<QueueData>>;
@@ -467,40 +547,18 @@ impl Operations for NullBlkDevice {
         mut rq: Owned<mq::Request<Self>>,
         _is_last: bool,
     ) -> Result {
-        if queue_data.bad_blocks.enabled() {
-            let start = rq.sector();
-            let end = start + u64::from(rq.sectors());
-            match queue_data.bad_blocks.check(start..end) {
-                badblocks::BlockStatus::None => {}
-                badblocks::BlockStatus::Acknowledged(range)
-                | badblocks::BlockStatus::Unacknowledged(range) => {
-                    rq.data_ref().error.store(1, ordering::Relaxed);
-                    if queue_data.bad_blocks_once {
-                        queue_data.bad_blocks.set_good(range)?;
-                    }
-                }
-            };
-        }
+        let mut sectors = rq.sectors();
 
-        // TODO: Skip IO if bad block.
+        Self::handle_bad_blocks(&mut rq, queue_data.get_ref(), &mut sectors)?;
 
         if queue_data.memory_backed {
             memalloc_scope!(let _noio: NoIo);
             let tree = &queue_data.tree;
-            let command = rq.command();
-            let mut sector = rq.sector();
 
-            if command == bindings::req_op_REQ_OP_DISCARD {
-                Self::discard(tree, sector, rq.sectors().into(), queue_data.block_size)?;
+            if rq.command() == bindings::req_op_REQ_OP_DISCARD {
+                Self::discard(tree, rq.sector(), sectors.into(), queue_data.block_size)?;
             } else {
-                for bio in rq.bio_iter_mut() {
-                    let segment_iter = bio.segment_iter();
-                    for segment in segment_iter {
-                        let length = segment.len();
-                        Self::transfer(command, tree, sector, segment)?;
-                        sector += u64::from(length) >> block::SECTOR_SHIFT;
-                    }
-                }
+                Self::transfer(&mut rq, tree, sectors)?;
             }
         }
 
