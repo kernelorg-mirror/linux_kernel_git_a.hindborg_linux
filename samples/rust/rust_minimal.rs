@@ -36,7 +36,7 @@ impl kernel::Module for RustMinimal {
         );
         pr_info!(
             "test_bool_parameter: {}\n",
-            *module_parameters::test_bool_parameter.value()
+            module_parameters::test_bool_parameter.value()
         );
 
         let mut numbers = KVec::new();
