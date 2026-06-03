@@ -29,6 +29,24 @@ use core::{
 
 /// A wrapper around a blk-mq [`struct request`]. This represents an IO request.
 ///
+/// # Lifetime
+///
+/// The [`struct request`] backing a [`Request`] is not allocated and freed for
+/// each IO. Instead, a fixed pool of requests is allocated up front when the
+/// [`TagSet`](crate::block::mq::TagSet) is initialized, with one request per
+/// available tag. A single request allocation is then reused to service many
+/// distinct IO operations over the lifetime of the request queue: when the
+/// block layer needs to process an IO, it assigns a free tag and hands the
+/// driver the associated request, and once that IO completes the request is
+/// returned to the pool to later be handed out again for an unrelated IO.
+///
+/// The private data area of the request, which holds the driver defined
+/// [`Operations::RequestData`], shares this lifetime. It is initialized once
+/// when the request pool is allocated and dropped once when the pool is torn
+/// down - not once per IO. As a result, [`Operations::RequestData`] persists
+/// across the many IO operations that reuse the same request, and a driver must
+/// not assume that it is reset to a fresh value at the start of each IO.
+///
 /// # Implementation details
 ///
 /// There are three states for a request that the Rust bindings care about:
